@@ -1,0 +1,1240 @@
+--- a/VERSION.txt
++++ b/VERSION.txt
+@@ -1,6 +1,2 @@
+-PKG_DoW Boost 2.1
+-2026-09-02
+-
+-Renderer: persistent Vulkan pipeline cache, shader-specialization index, dynamic blend constants,
+-canonical blend-state keys, narrow sRGB fix, cache telemetry.
+-Launcher: HTML/CSS/JS UX, per-game profiles, Python backend + Windows PowerShell fallback, 1.bat.
++PKG_DoW Boost 2.2
++CUSA + Vulkan integration pass
+--- a/1.bat
++++ b/1.bat
+@@ -1,7 +1,7 @@
+ @echo off
+ setlocal EnableExtensions
+ cd /d "%~dp0"
+-title PKG_DoW 2.1 - Launcher Local
++title PKG_DoW 2.2 - Launcher Local
+ set "PYTHONUTF8=1"
+ set "PYTHONDONTWRITEBYTECODE=1"
+ 
+@@ -26,7 +26,7 @@
+ )
+ 
+ echo.
+-echo  PKG_DoW 2.1
++echo  PKG_DoW 2.2
+ echo  ==========
+ echo  Python 3.10+ nao encontrado. Usando o servidor PowerShell incluido.
+ echo  A UX continua local em 127.0.0.1 e abre automaticamente.
+@@ -44,7 +44,7 @@
+ 
+ :RUN_PYTHON
+ echo.
+-echo  PKG_DoW 2.1
++echo  PKG_DoW 2.2
+ echo  ==========
+ echo  Iniciando UX local... o navegador abre automaticamente.
+ echo  Esta janela mantem o launcher ativo. Feche-a para encerrar a UX.
+--- a/README.md
++++ b/README.md
+@@ -17,6 +17,13 @@
+ > not distribute games or copyrighted system software. Use only game files that you have obtained
+ > legally.
+ 
++### PKG_DoW 2.2 launcher layer
++
++This package also includes a local web launcher (`1.bat`) with CUSA-aware PS4 dispatch through a
++user-supplied shadPS4 executable and a native Vulkan adapter probe. The launcher does not contain
++games, keys, firmware, or a PKG decryption/install path. See `LEIA-ME_PKG_DoW.md` and
++`docs/CUSA_VULKAN_2_2.md`.
++
+ ## Current Status
+ 
+ KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
+--- a/LEIA-ME_PKG_DoW.md
++++ b/LEIA-ME_PKG_DoW.md
+@@ -1,4 +1,4 @@
+-# PKG_DoW 2.1 — início rápido
++# PKG_DoW 2.2 — início rápido
+ 
+ Este pacote contém o código KytyPS5 analisado, correções de shader/render, uma camada de performance e uma UX local. **Não contém jogos, firmware nem chaves.**
+ 
+@@ -41,13 +41,29 @@
+ 
+ O core usa `--game <dir|elf>`. Uma pasta deve conter o dump/arquivos esperados pelo Kyty, normalmente incluindo `eboot.bin` e `sce_sys/param.sfo` quando aplicável.
+ 
+-## PS4
++## PS4 / CUSA
+ 
+-Esta árvore KytyPS5 continua sendo um core PS5/Prospero. Para PS4 a UX pode despachar uma pasta/`eboot.bin` já instalado/extraído para `shadPS4.exe`. `.pkg` bruto é catalogado, não iniciado diretamente.
++Esta árvore KytyPS5 continua sendo um core PS5/Prospero. Para PS4 a UX integra um `shadPS4.exe` externo e agora trata CUSA como identidade de primeira classe:
++
++- scanner de raiz para pastas `CUSAxxxxx`;
++- leitura de `TITLE_ID`, `CONTENT_ID`, `APP_VER`, `SYSTEM_VER` e categoria quando o `param.sfo` está disponível;
++- perfil e modo de boot por CUSA;
++- modo **Auto/eboot** (mais independente) e modo **CUSA** para títulos já cadastrados na biblioteca do shadPS4;
++- detecção dinâmica dos argumentos suportados pelo `shadPS4 --help`, evitando prender a UX a uma versão específica do core.
++
++`.pkg` bruto é catalogado, não iniciado diretamente. O launcher não descriptografa nem instala conteúdo protegido.
++
++## Vulkan 2.2
++
++A UX consulta o loader Vulkan diretamente via API nativa, sem exigir Vulkan SDK ou pacote Python. Ela enumera adaptadores, versão da API, tipo de GPU, memória device-local e verifica `VK_KHR_swapchain`/`VK_KHR_push_descriptor`, requisitos atuais do shadPS4. O seletor de GPU usa o mesmo índice de enumeração Vulkan passado ao Kyty quando configurado.
++
++No core C++, o modo automático de GPU também foi reforçado: índice inválido não acessa mais o vetor fora do limite e a seleção automática pontua tipo de GPU + memória local, evitando escolher uma placa dedicada pior só por aparecer por último na enumeração.
++
++Detalhes em `docs/CUSA_VULKAN_2_2.md`.
+ 
+ ## Compilação do core
+ 
+-O ZIP original recebido não trouxe todos os submódulos/dependências C++ necessários para gerar um novo `kyty_emulator.exe` Windows dentro deste sandbox. As mudanças do core estão no fonte, mas precisam ser compiladas num clone/dependency tree completo. Veja `docs/build_probe.log`.
++O ZIP original recebido não trouxe todos os submódulos/dependências C++ necessários para gerar um novo `kyty_emulator.exe` Windows dentro deste sandbox. As mudanças do core estão no fonte, mas precisam ser compiladas num clone/dependency tree completo. Veja `docs/build_2_2_configure.log`.
+ 
+ ## O que foi realmente validado
+ 
+--- a/tools/pkg_dow_server.py
++++ b/tools/pkg_dow_server.py
+@@ -9,6 +9,7 @@
+ 
+ import argparse
+ import ctypes
++import ctypes.util
+ import hashlib
+ import json
+ import mimetypes
+@@ -51,6 +52,7 @@
+     "vblank_frequency": 60,
+     "redzone": True,
+     "playgo_hack": False,
++    "ps4_boot_mode": "auto",
+ }
+ 
+ PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
+@@ -97,6 +99,15 @@
+     return hashlib.sha1(str(path.resolve()).lower().encode("utf-8", "replace")).hexdigest()[:16]
+ 
+ 
++def game_identity(path: Path, title_id: str) -> str:
++    # CUSA is the useful identity for PS4 library management: rescanning a moved game updates
++    # its path instead of creating a second card for the same title.
++    normalized = normalize_title_id(title_id) if "normalize_title_id" in globals() else str(title_id or "").upper()
++    if re.fullmatch(r"CUSA\d{5}", normalized):
++        return hashlib.sha1(("ps4:" + normalized).encode("ascii")).hexdigest()[:16]
++    return stable_id(path)
++
++
+ def parse_sfo(path: Path) -> dict[str, Any]:
+     """Minimal PARAM.SFO reader for string/integer fields."""
+     try:
+@@ -166,6 +177,49 @@
+     return meta
+ 
+ 
++CUSA_RE = re.compile(r"^CUSA\d{5}$", re.IGNORECASE)
++TITLE_ID_RE = re.compile(r"\b(?:CUSA|PPSA|LAPY|NPXS|NPXX)\d{5}\b", re.IGNORECASE)
++
++
++def normalize_title_id(value: Any) -> str:
++    text = str(value or "").strip().upper()
++    match = TITLE_ID_RE.search(text)
++    return match.group(0).upper() if match else text[:16]
++
++
++def infer_title_id_from_path(path: Path) -> str:
++    candidates = [path.stem, path.name]
++    try:
++        candidates += [path.parent.name, path.parent.parent.name]
++    except Exception:
++        pass
++    for candidate in candidates:
++        match = TITLE_ID_RE.search(str(candidate).upper())
++        if match:
++            return match.group(0).upper()
++    return ""
++
++
++def content_region(content_id: str) -> str:
++    prefix = str(content_id or "").upper()[:2]
++    return {
++        "UP": "Américas", "EP": "Europa", "JP": "Japão", "HP": "Ásia",
++        "KP": "Coreia", "IP": "Internacional",
++    }.get(prefix, "")
++
++
++def format_system_version(value: Any) -> str:
++    try:
++        num = int(value)
++    except (TypeError, ValueError):
++        return str(value or "")
++    if num <= 0:
++        return ""
++    # PARAM.SFO system versions are conventionally encoded as packed hexadecimal bytes.
++    text = f"{num:08X}"
++    return f"{int(text[0:2],16)}.{text[2:4]}.{text[4:6]}"
++
++
+ def infer_platform(path: Path, meta: dict[str, Any]) -> str:
+     title_id = str(meta.get("TITLE_ID") or meta.get("title_id") or "").upper()
+     title = str(meta.get("TITLE") or meta.get("title") or "").upper()
+@@ -218,16 +272,21 @@
+         icon = find_icon(p.parent)
+ 
+     title = str(meta.get("TITLE") or meta.get("title") or p.stem or p.name)
+-    title_id = str(meta.get("TITLE_ID") or meta.get("title_id") or "")
++    title_id = normalize_title_id(meta.get("TITLE_ID") or meta.get("title_id") or infer_title_id_from_path(p))
+     platform_name = infer_platform(p, meta)
+     size = p.stat().st_size if p.is_file() else 0
+     return {
+-        "id": stable_id(p), "path": str(p), "title": title, "title_id": title_id,
+-        "content_id": str(meta.get("content_id") or ""), "platform": platform_name,
++        "id": game_identity(p, title_id), "path": str(p), "title": title, "title_id": title_id,
++        "content_id": str(meta.get("CONTENT_ID") or meta.get("content_id") or ""), "platform": platform_name,
+         "kind": kind, "size": size, "favorite": False, "last_played": 0,
+         "play_seconds": 0, "added_at": int(time.time()), "icon": icon,
+         "status": "Pronto" if kind != "pkg" else "Precisa instalar/extrair",
+-        "profile_override": "global",
++        "profile_override": "global", "ps4_boot_mode": "auto",
++        "app_ver": str(meta.get("APP_VER") or meta.get("VERSION") or ""),
++        "category": str(meta.get("CATEGORY") or ""),
++        "system_ver": format_system_version(meta.get("SYSTEM_VER") or meta.get("SYSTEM_VER_REQUIRED") or ""),
++        "region": content_region(str(meta.get("CONTENT_ID") or meta.get("content_id") or "")),
++        "cusa": bool(CUSA_RE.fullmatch(title_id)),
+     }
+ 
+ 
+@@ -236,7 +295,7 @@
+         items = library()
+         for i, old in enumerate(items):
+             if old.get("id") == item["id"]:
+-                for key in ("favorite", "last_played", "play_seconds", "added_at", "profile_override"):
++                for key in ("favorite", "last_played", "play_seconds", "added_at", "profile_override", "ps4_boot_mode"):
+                     if key in old:
+                         item[key] = old[key]
+                 items[i] = item
+@@ -276,17 +335,224 @@
+     return {"kyty": kyty, "shadps4": shad}
+ 
+ 
+-def vulkan_runtime_available() -> bool:
++_vulkan_probe_cache: tuple[float, dict[str, Any]] | None = None
++_engine_help_cache: dict[str, tuple[float, float, set[str]]] = {}
++
++
++def _vk_version(value: int) -> str:
++    return f"{(value >> 22) & 0x3ff}.{(value >> 12) & 0x3ff}.{value & 0xfff}"
++
++
++def _load_vulkan_library() -> Any:
++    names: list[str] = []
+     if os.name == "nt":
+-        windir = Path(os.environ.get("WINDIR", r"C:\\Windows"))
+-        return (windir / "System32" / "vulkan-1.dll").is_file()
+-    if sys.platform == "darwin":
+-        # MoltenVK can be bundled with the emulator; engine discovery is the more useful signal.
+-        return True
+-    return any(Path(p).is_file() for p in (
+-        "/usr/lib/libvulkan.so.1", "/usr/lib64/libvulkan.so.1",
+-        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+-    ))
++        names = [str(Path(os.environ.get("WINDIR", r"C:\\Windows")) / "System32" / "vulkan-1.dll"), "vulkan-1.dll"]
++    elif sys.platform == "darwin":
++        names = ["libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib"]
++    else:
++        found = ctypes.util.find_library("vulkan")
++        names = [x for x in (found, "libvulkan.so.1", "libvulkan.so") if x]
++    for name in names:
++        try:
++            return ctypes.CDLL(name)
++        except OSError:
++            continue
++    return None
++
++
++def vulkan_probe(force: bool = False) -> dict[str, Any]:
++    """Probe the Vulkan loader and adapters without requiring the Vulkan SDK or Python packages."""
++    global _vulkan_probe_cache
++    now = time.time()
++    if not force and _vulkan_probe_cache and now - _vulkan_probe_cache[0] < 30:
++        return _vulkan_probe_cache[1]
++
++    result: dict[str, Any] = {"available": False, "loader_version": "", "gpus": [], "error": ""}
++    lib = _load_vulkan_library()
++    if lib is None:
++        result["error"] = "Vulkan loader não encontrado"
++        _vulkan_probe_cache = (now, result)
++        return result
++
++    VkInstance = ctypes.c_void_p
++    VkPhysicalDevice = ctypes.c_void_p
++    VkResult = ctypes.c_int32
++    VK_SUCCESS = 0
++    VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
++    VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
++    VK_API_VERSION_1_0 = 1 << 22
++    VK_API_VERSION_1_3 = (1 << 22) | (3 << 12)
++    VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1
++
++    class VkApplicationInfo(ctypes.Structure):
++        _fields_ = [("sType", ctypes.c_uint32), ("pNext", ctypes.c_void_p),
++                    ("pApplicationName", ctypes.c_char_p), ("applicationVersion", ctypes.c_uint32),
++                    ("pEngineName", ctypes.c_char_p), ("engineVersion", ctypes.c_uint32),
++                    ("apiVersion", ctypes.c_uint32)]
++
++    class VkInstanceCreateInfo(ctypes.Structure):
++        _fields_ = [("sType", ctypes.c_uint32), ("pNext", ctypes.c_void_p), ("flags", ctypes.c_uint32),
++                    ("pApplicationInfo", ctypes.POINTER(VkApplicationInfo)),
++                    ("enabledLayerCount", ctypes.c_uint32), ("ppEnabledLayerNames", ctypes.c_void_p),
++                    ("enabledExtensionCount", ctypes.c_uint32), ("ppEnabledExtensionNames", ctypes.c_void_p)]
++
++    class VkPhysicalDeviceProperties(ctypes.Structure):
++        _fields_ = [("apiVersion", ctypes.c_uint32), ("driverVersion", ctypes.c_uint32),
++                    ("vendorID", ctypes.c_uint32), ("deviceID", ctypes.c_uint32),
++                    ("deviceType", ctypes.c_uint32), ("deviceName", ctypes.c_char * 256),
++                    ("pipelineCacheUUID", ctypes.c_uint8 * 16), ("_tail", ctypes.c_uint8 * 4096)]
++
++    class VkExtensionProperties(ctypes.Structure):
++        _fields_ = [("extensionName", ctypes.c_char * 256), ("specVersion", ctypes.c_uint32)]
++
++    class VkMemoryType(ctypes.Structure):
++        _fields_ = [("propertyFlags", ctypes.c_uint32), ("heapIndex", ctypes.c_uint32)]
++
++    class VkMemoryHeap(ctypes.Structure):
++        _fields_ = [("size", ctypes.c_uint64), ("flags", ctypes.c_uint32)]
++
++    class VkPhysicalDeviceMemoryProperties(ctypes.Structure):
++        _fields_ = [("memoryTypeCount", ctypes.c_uint32), ("memoryTypes", VkMemoryType * 32),
++                    ("memoryHeapCount", ctypes.c_uint32), ("memoryHeaps", VkMemoryHeap * 16)]
++
++    instance = VkInstance()
++    try:
++        loader_version = VK_API_VERSION_1_0
++        enum_ver = getattr(lib, "vkEnumerateInstanceVersion", None)
++        if enum_ver is not None:
++            enum_ver.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
++            enum_ver.restype = VkResult
++            version_out = ctypes.c_uint32()
++            if enum_ver(ctypes.byref(version_out)) == VK_SUCCESS:
++                loader_version = int(version_out.value)
++        result["loader_version"] = _vk_version(loader_version)
++        app = VkApplicationInfo(VK_STRUCTURE_TYPE_APPLICATION_INFO, None, b"PKG_DoW", 0, b"PKG_DoW", 0,
++                                min(loader_version, VK_API_VERSION_1_3))
++        create = VkInstanceCreateInfo(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, None, 0, ctypes.pointer(app), 0, None, 0, None)
++        lib.vkCreateInstance.argtypes = [ctypes.POINTER(VkInstanceCreateInfo), ctypes.c_void_p, ctypes.POINTER(VkInstance)]
++        lib.vkCreateInstance.restype = VkResult
++        rc = int(lib.vkCreateInstance(ctypes.byref(create), None, ctypes.byref(instance)))
++        if rc != VK_SUCCESS or not instance:
++            result["error"] = f"vkCreateInstance falhou ({rc})"
++            return result
++
++        lib.vkEnumeratePhysicalDevices.argtypes = [VkInstance, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(VkPhysicalDevice)]
++        lib.vkEnumeratePhysicalDevices.restype = VkResult
++        count = ctypes.c_uint32()
++        rc = int(lib.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), None))
++        if rc != VK_SUCCESS or count.value == 0:
++            result["error"] = "Nenhum adaptador Vulkan encontrado"
++            return result
++        devices = (VkPhysicalDevice * count.value)()
++        rc = int(lib.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), devices))
++        if rc != VK_SUCCESS:
++            result["error"] = f"vkEnumeratePhysicalDevices falhou ({rc})"
++            return result
++
++        lib.vkGetPhysicalDeviceProperties.argtypes = [VkPhysicalDevice, ctypes.POINTER(VkPhysicalDeviceProperties)]
++        lib.vkGetPhysicalDeviceProperties.restype = None
++        lib.vkGetPhysicalDeviceMemoryProperties.argtypes = [VkPhysicalDevice, ctypes.POINTER(VkPhysicalDeviceMemoryProperties)]
++        lib.vkGetPhysicalDeviceMemoryProperties.restype = None
++        lib.vkEnumerateDeviceExtensionProperties.argtypes = [VkPhysicalDevice, ctypes.c_char_p,
++                                                               ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(VkExtensionProperties)]
++        lib.vkEnumerateDeviceExtensionProperties.restype = VkResult
++        type_names = {0: "Outro", 1: "Integrada", 2: "Dedicada", 3: "Virtual", 4: "CPU"}
++        gpus: list[dict[str, Any]] = []
++        for index, dev in enumerate(devices):
++            props = VkPhysicalDeviceProperties(); lib.vkGetPhysicalDeviceProperties(dev, ctypes.byref(props))
++            mem = VkPhysicalDeviceMemoryProperties(); lib.vkGetPhysicalDeviceMemoryProperties(dev, ctypes.byref(mem))
++            local_bytes = 0
++            for i in range(min(int(mem.memoryHeapCount), 16)):
++                heap = mem.memoryHeaps[i]
++                if int(heap.flags) & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT:
++                    local_bytes += int(heap.size)
++            ext_count = ctypes.c_uint32()
++            extensions: set[str] = set()
++            if lib.vkEnumerateDeviceExtensionProperties(dev, None, ctypes.byref(ext_count), None) == VK_SUCCESS and ext_count.value:
++                exts = (VkExtensionProperties * ext_count.value)()
++                if lib.vkEnumerateDeviceExtensionProperties(dev, None, ctypes.byref(ext_count), exts) == VK_SUCCESS:
++                    for ext in exts:
++                        extensions.add(bytes(ext.extensionName).split(b"\0", 1)[0].decode("ascii", "ignore"))
++            api_value = int(props.apiVersion)
++            gpus.append({
++                "index": index,
++                "name": bytes(props.deviceName).split(b"\0", 1)[0].decode("utf-8", "replace"),
++                "type": type_names.get(int(props.deviceType), "Outro"),
++                "api_version": _vk_version(api_value), "api_version_raw": api_value,
++                "driver_version": int(props.driverVersion), "vendor_id": int(props.vendorID), "device_id": int(props.deviceID),
++                "vram": local_bytes,
++                "swapchain": "VK_KHR_swapchain" in extensions,
++                "push_descriptor": "VK_KHR_push_descriptor" in extensions,
++                "shadps4_ready": api_value >= VK_API_VERSION_1_3 and "VK_KHR_swapchain" in extensions and "VK_KHR_push_descriptor" in extensions,
++            })
++        result["gpus"] = gpus
++        result["available"] = bool(gpus)
++        return result
++    except Exception as exc:
++        result["error"] = f"Falha no probe Vulkan: {exc}"
++        return result
++    finally:
++        if instance:
++            try:
++                lib.vkDestroyInstance.argtypes = [VkInstance, ctypes.c_void_p]
++                lib.vkDestroyInstance.restype = None
++                lib.vkDestroyInstance(instance, None)
++            except Exception:
++                pass
++        _vulkan_probe_cache = (now, result)
++
++
++def vulkan_runtime_available() -> bool:
++    return bool(vulkan_probe().get("available"))
++
++
++def engine_cli_options(exe: str) -> set[str]:
++    """Discover command line flags from --help so launcher integration follows the installed core version."""
++    if not exe:
++        return set()
++    try:
++        mtime = Path(exe).stat().st_mtime
++    except OSError:
++        return set()
++    cached = _engine_help_cache.get(exe)
++    if cached and cached[0] == mtime and time.time() - cached[1] < 300:
++        return cached[2]
++    options: set[str] = set()
++    try:
++        cp = subprocess.run([exe, "--help"], cwd=str(Path(exe).parent), capture_output=True,
++                            text=True, errors="replace", timeout=5, check=False)
++        text = (cp.stdout or "") + "\n" + (cp.stderr or "")
++        options.update(re.findall(r"(?<!\w)--[A-Za-z0-9][A-Za-z0-9_-]*", text))
++        options.update(re.findall(r"(?<!\w)-[A-Za-z](?=\s|,|$)", text))
++    except (OSError, subprocess.SubprocessError):
++        pass
++    _engine_help_cache[exe] = (mtime, time.time(), options)
++    return options
++
++
++def scan_cusa_root(raw_path: str, max_games: int = 500) -> list[dict[str, Any]]:
++    root = Path(raw_path).expanduser().resolve()
++    if not root.is_dir():
++        raise ValueError("A raiz CUSA precisa ser uma pasta")
++    found: list[dict[str, Any]] = []
++    for current, dirs, files in os.walk(root):
++        here = Path(current)
++        has_sfo = (here / "sce_sys" / "param.sfo").is_file() or (here / "param.sfo").is_file()
++        has_eboot = "eboot.bin" in {name.lower() for name in files}
++        path_title = infer_title_id_from_path(here)
++        if has_sfo or (has_eboot and CUSA_RE.fullmatch(path_title or "")):
++            try:
++                game = describe_import(str(here))
++                if game.get("platform") == "PS4" or game.get("cusa"):
++                    found.append(upsert_game(game))
++            except (OSError, ValueError):
++                pass
++            dirs[:] = []
++            if len(found) >= max_games:
++                break
++        # Skip obviously huge/generated trees which cannot be game roots.
++        dirs[:] = [d for d in dirs if d.lower() not in {"_sce_module", "sce_module", "data", "cache", "shadercache", "trophy2"}]
++    return found
+ 
+ 
+ def directory_size(path: Path) -> int:
+@@ -310,6 +576,9 @@
+     roots: list[Path] = [ROOT / "_PipelineCache"]
+     if engines.get("kyty"):
+         roots.append(Path(engines["kyty"]).parent / "_PipelineCache")
++    if engines.get("shadps4"):
++        shad_root = Path(engines["shadps4"]).parent
++        roots += [shad_root / "shader_cache", shad_root / "cache", shad_root / "user" / "shader_cache"]
+     unique: list[Path] = []
+     seen: set[str] = set()
+     for root in roots:
+@@ -353,6 +622,7 @@
+     disk = shutil.disk_usage(ROOT)
+     engines = engine_paths()
+     cache = pipeline_cache_info(engines)
++    vk = vulkan_probe()
+     active = {gid: proc.pid for gid, proc in list(_processes.items()) if proc.poll() is None}
+     return {
+         "cpu_name": platform.processor() or platform.machine() or "CPU",
+@@ -361,8 +631,9 @@
+         "disk_total": disk.total, "disk_used": disk.used,
+         "platform": platform.platform(), "python": platform.python_version(),
+         "engines": engines, "core_ready": bool(engines["kyty"] or engines["shadps4"]),
+-        "vulkan_runtime": vulkan_runtime_available(),
++        "vulkan_runtime": bool(vk.get("available")), "vulkan": vk,
+         "pipeline_cache": cache, "active_processes": active,
++        "shadps4_cli": sorted(engine_cli_options(engines.get("shadps4", ""))),
+         "time": int(time.time()),
+     }
+ 
+@@ -412,13 +683,38 @@
+     if platform_name == "PS4":
+         exe = engines["shadps4"]
+         if not exe:
+-            raise RuntimeError("Core PS4 não configurado. A árvore KytyPS5 atual rejeita ELF de jogo PS4; configure um shadPS4.exe em Configurações.")
+-        target = p / "eboot.bin" if p.is_dir() else p
+-        if p.is_dir() and not target.is_file():
+-            found = list(p.rglob("eboot.bin"))[:1]
+-            if not found: raise RuntimeError("Nenhum eboot.bin encontrado na pasta PS4.")
+-            target = found[0]
+-        args = [exe, str(target)]
++            raise RuntimeError("Core PS4 não configurado. Configure um shadPS4.exe em Configurações.")
++        title_id = normalize_title_id(game.get("title_id"))
++        options = engine_cli_options(exe)
++        boot_mode = str(game.get("ps4_boot_mode") or cfg.get("ps4_boot_mode") or "auto").lower()
++        if boot_mode not in {"auto", "eboot", "cusa"}:
++            boot_mode = "auto"
++        # Auto favors direct ELF because it does not depend on shadPS4's own registered game-folder list.
++        # CUSA mode is available for users who already keep the title in shadPS4's library.
++        use_cusa = boot_mode == "cusa" and bool(CUSA_RE.fullmatch(title_id))
++        if use_cusa:
++            args = [exe, title_id]
++            launch_target = title_id
++        else:
++            target = p / "eboot.bin" if p.is_dir() else p
++            if p.is_dir() and not target.is_file():
++                found = list(p.rglob("eboot.bin"))[:1]
++                if not found:
++                    raise RuntimeError("Nenhum eboot.bin encontrado na pasta PS4.")
++                target = found[0]
++            args = [exe, str(target)]
++            launch_target = str(target)
++        if bool(cfg.get("fullscreen", False)) and "--fullscreen" in options:
++            args += ["--fullscreen", "true"]
++        gpu = int(cfg.get("gpu_index", -1) or -1)
++        if gpu >= 0:
++            gpu_flag = next((flag for flag in ("--gpu-id", "--gpu", "--gpu_id") if flag in options), "")
++            if gpu_flag:
++                args += [gpu_flag, str(gpu)]
++        present = str(cfg.get("present_mode", "Fifo"))
++        present_flag = next((flag for flag in ("--present-mode", "--present_mode") if flag in options), "")
++        if present_flag:
++            args += [present_flag, present.lower()]
+         engine = "shadPS4"
+     else:
+         exe = engines["kyty"]
+@@ -453,13 +749,17 @@
+         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+     started = time.time()
+     try:
++        launch_env = os.environ.copy()
++        launch_env["PKG_DOW_TITLE_ID"] = normalize_title_id(game.get("title_id"))
+         proc = subprocess.Popen(args, cwd=str(Path(exe).parent), stdout=log, stderr=subprocess.STDOUT,
+-                                creationflags=flags)
++                                creationflags=flags, env=launch_env)
+     finally:
+         log.close()
+     _processes[game_id] = proc
+     threading.Thread(target=_watch_process, args=(game_id, proc, started, engine), daemon=True).start()
+     game["last_played"] = int(started); game["status"] = f"Executando com {engine}"
++    if platform_name == "PS4":
++        game["last_boot_target"] = launch_target
+     game["last_exit_code"] = None
+     items[index] = game; save_json(LIBRARY_FILE, items)
+     return {"ok": True, "pid": proc.pid, "engine": engine, "log": str(log_path), "args": args}
+@@ -525,7 +825,7 @@
+ 
+ 
+ class Handler(BaseHTTPRequestHandler):
+-    server_version = "PKG_DoW/2.1"
++    server_version = "PKG_DoW/2.2"
+ 
+     def log_message(self, fmt: str, *args: Any) -> None:
+         # Keep the console useful instead of reenacting a 1990s access log waterfall.
+@@ -560,13 +860,19 @@
+                 st = system_status()
+                 checks = [
+                     {"name": "Python 3.10+", "ok": sys.version_info >= (3, 10), "detail": platform.python_version()},
+-                    {"name": "Runtime Vulkan", "ok": bool(st["vulkan_runtime"]), "detail": "vulkan-1 / loader"},
++                    {"name": "Runtime Vulkan", "ok": bool(st["vulkan_runtime"]), "detail": f"Loader {st.get('vulkan',{}).get('loader_version') or 'não detectado'}"},
++                    {"name": "GPU Vulkan 1.3", "ok": any(int(g.get("api_version_raw",0)) >= ((1<<22)|(3<<12)) for g in st.get("vulkan",{}).get("gpus",[])), "detail": ", ".join(g.get("name","") for g in st.get("vulkan",{}).get("gpus",[])) or "nenhuma"},
++                    {"name": "PS4 Vulkan extensions", "ok": any(bool(g.get("shadps4_ready")) for g in st.get("vulkan",{}).get("gpus",[])), "detail": "Vulkan 1.3 + VK_KHR_swapchain + VK_KHR_push_descriptor"},
+                     {"name": "Core PS5", "ok": bool(st["engines"].get("kyty")), "detail": st["engines"].get("kyty") or "não configurado"},
+                     {"name": "Core PS4", "ok": bool(st["engines"].get("shadps4")), "detail": st["engines"].get("shadps4") or "opcional"},
+                     {"name": "RAM >= 16 GB", "ok": int(st["ram_total"]) >= 16 * 1024**3, "detail": str(st["ram_total"])},
+                     {"name": "Disco livre >= 10 GB", "ok": int(st["disk_total"] - st["disk_used"]) >= 10 * 1024**3, "detail": str(st["disk_total"] - st["disk_used"])},
+                 ]
+                 return self.send_json({"ok": True, "checks": checks, "status": st})
++            if u.path == "/api/vulkan": return self.send_json(vulkan_probe(force=True))
++            if u.path == "/api/cusa":
++                games = [g for g in library() if bool(g.get("cusa")) or CUSA_RE.fullmatch(normalize_title_id(g.get("title_id")))]
++                return self.send_json({"count": len(games), "games": games})
+             if u.path == "/api/library": return self.send_json(library())
+             if u.path == "/api/settings": return self.send_json(settings())
+             if u.path == "/api/logs":
+@@ -612,6 +918,11 @@
+                 chosen=choose_import(str(body.get("kind","file")))
+                 if not chosen: return self.send_json({"ok":False,"cancelled":True})
+                 item=upsert_game(describe_import(chosen)); return self.send_json({"ok":True,"game":item})
++            if u.path == "/api/scan-cusa":
++                chosen = str(body.get("path") or "").strip() or choose_import("folder")
++                if not chosen: return self.send_json({"ok": False, "cancelled": True})
++                games = scan_cusa_root(chosen)
++                return self.send_json({"ok": True, "path": chosen, "count": len(games), "games": games})
+             if u.path == "/api/launch": return self.send_json(launch_game(str(body.get("id",""))))
+             if u.path == "/api/game-profile":
+                 game_id = str(body.get("id", "")); profile = str(body.get("profile", "global"))
+@@ -621,6 +932,11 @@
+                 if game is None: raise KeyError("jogo não encontrado")
+                 game["profile_override"] = profile; save_json(LIBRARY_FILE, items)
+                 return self.send_json({"ok": True, "game": game})
++            if u.path == "/api/game-boot-mode":
++                game_id = str(body.get("id", "")); mode = str(body.get("mode", "auto")).lower()
++                if mode not in {"auto", "eboot", "cusa"}: raise ValueError("modo de boot PS4 inválido")
++                items,i,g = game_by_id(game_id); g["ps4_boot_mode"] = mode; items[i] = g; save_json(LIBRARY_FILE, items)
++                return self.send_json({"ok": True, "game": g})
+             if u.path == "/api/favorite":
+                 items,i,g=game_by_id(str(body.get("id",""))); g["favorite"]=bool(body.get("value",not g.get("favorite")))
+                 items[i]=g; save_json(LIBRARY_FILE,items); return self.send_json({"ok":True,"game":g})
+@@ -640,6 +956,8 @@
+                     raise ValueError("perfil de performance inválido")
+                 if not re.fullmatch(r"\d{3,5}x\d{3,5}", str(cfg.get("resolution"))):
+                     raise ValueError("resolução inválida")
++                if str(cfg.get("ps4_boot_mode")) not in {"auto", "eboot", "cusa"}:
++                    raise ValueError("modo PS4 inválido")
+                 cfg["gpu_index"] = max(-1, int(cfg.get("gpu_index", -1) or -1))
+                 cfg["vblank_frequency"] = max(30, min(360, int(cfg.get("vblank_frequency", 60) or 60)))
+                 cfg["player_name"] = str(cfg.get("player_name", "Player1"))[:16] or "Player1"
+--- a/tools/pkg_dow_server.ps1
++++ b/tools/pkg_dow_server.ps1
+@@ -1,4 +1,4 @@
+-﻿param(
++param(
+     [int]$Port = 8765,
+     [switch]$NoBrowser
+ )
+@@ -25,6 +25,7 @@
+     vblank_frequency = 60
+     redzone = $true
+     playgo_hack = $false
++    ps4_boot_mode = 'auto'
+ }
+ $ProfileOverrides = @{
+     stable   = @{ present_mode='Fifo'; shader_optimization='None'; resolution='1280x720'; vblank_frequency=60; redzone=$true }
+@@ -73,6 +74,13 @@
+     return (-join ($hash[0..7] | ForEach-Object { $_.ToString('x2') }))
+ }
+ 
++function Get-TextId([string]$Text) {
++    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text.ToLowerInvariant())
++    $sha = [System.Security.Cryptography.SHA1]::Create()
++    try { $hash = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
++    return (-join ($hash[0..7] | ForEach-Object { $_.ToString('x2') }))
++}
++
+ function Find-Engine([string]$Kind) {
+     $cfg = Get-Settings
+     $configured = if ($Kind -eq 'kyty') { [string]$cfg.kyty_path } else { [string]$cfg.shadps4_path }
+@@ -136,6 +144,23 @@
+     if ($changed) { Save-JsonFile $LibraryFile @($items) }
+ }
+ 
++function Get-VulkanProbe {
++    $loader = Join-Path $env:WINDIR 'System32\vulkan-1.dll'
++    $available = Test-Path -LiteralPath $loader
++    $gpus = New-Object System.Collections.ArrayList
++    $vkinfo = Get-Command vulkaninfo.exe -ErrorAction SilentlyContinue
++    if ($vkinfo) {
++        try {
++            $text = (& $vkinfo.Source --summary 2>&1 | Out-String)
++            $matches = [regex]::Matches($text, 'GPU(?<idx>\d+):[\s\S]*?deviceName\s*=\s*(?<name>[^\r\n]+)')
++            foreach ($m in $matches) {
++                [void]$gpus.Add([pscustomobject]@{index=[int]$m.Groups['idx'].Value;name=$m.Groups['name'].Value.Trim();type='GPU';api_version='';api_version_raw=0;driver_version=0;vendor_id=0;device_id=0;vram=0;swapchain=$true;push_descriptor=$false;shadps4_ready=$false})
++            }
++        } catch {}
++    }
++    return [pscustomobject]@{available=$available;loader_version='';gpus=@($gpus);error=$(if($available){''}else{'vulkan-1.dll não encontrado'})}
++}
++
+ function Get-SystemStatus {
+     Update-ProcessState
+     $driveRoot = [System.IO.Path]::GetPathRoot($Root)
+@@ -146,6 +171,7 @@
+     $active = [ordered]@{}
+     foreach ($id in $script:Processes.Keys) { $active[$id] = $script:Processes[$id] }
+     $cache = Get-CacheInfo
++    $vk = Get-VulkanProbe
+     return [pscustomobject]@{
+         ok = $true
+         os = [Environment]::OSVersion.VersionString
+@@ -155,12 +181,13 @@
+         ram_used = [Math]::Max(0L, $ramTotal-$ramFree)
+         disk_total = if ($drive) { [int64]$drive.Size } else { 0L }
+         disk_used = if ($drive) { [int64]($drive.Size-$drive.FreeSpace) } else { 0L }
+-        vulkan_runtime = (Test-Path -LiteralPath (Join-Path $env:WINDIR 'System32\vulkan-1.dll'))
++        vulkan_runtime = [bool]$vk.available
++        vulkan = $vk
+         engines = [pscustomobject]@{ kyty=(Find-Engine 'kyty'); shadps4=(Find-Engine 'shadps4') }
+         pipeline_cache = $cache
+         active_processes = [pscustomobject]$active
+         launcher = 'PowerShell fallback'
+-        server_version = 'PKG_DoW/2.1'
++        server_version = 'PKG_DoW/2.2'
+     }
+ }
+ 
+@@ -178,6 +205,42 @@
+     return [pscustomobject]@{ok=$true;checks=$checks;status=$s}
+ }
+ 
++function Read-ParamSfo([string]$Path) {
++    $out = @{}
++    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $out }
++    try {
++        [byte[]]$b = [System.IO.File]::ReadAllBytes($Path)
++        if ($b.Length -lt 20 -or $b[0] -ne 0 -or $b[1] -ne 0x50 -or $b[2] -ne 0x53 -or $b[3] -ne 0x46) { return $out }
++        $keyOff = [BitConverter]::ToUInt32($b, 8)
++        $dataOff = [BitConverter]::ToUInt32($b, 12)
++        $count = [BitConverter]::ToUInt32($b, 16)
++        for ($i=0; $i -lt $count; $i++) {
++            $off = 20 + 16*$i; if ($off + 16 -gt $b.Length) { break }
++            $keyIdx = [BitConverter]::ToUInt16($b, $off)
++            $fmt = [BitConverter]::ToUInt16($b, $off+2)
++            $len = [BitConverter]::ToUInt32($b, $off+4)
++            $maxLen = [BitConverter]::ToUInt32($b, $off+8)
++            $valueOff = [BitConverter]::ToUInt32($b, $off+12)
++            $keyPos = [int]($keyOff + $keyIdx); if ($keyPos -ge $b.Length) { continue }
++            $keyEnd = $keyPos; while ($keyEnd -lt $b.Length -and $b[$keyEnd] -ne 0) { $keyEnd++ }
++            $key = [Text.Encoding]::UTF8.GetString($b, $keyPos, $keyEnd-$keyPos)
++            $pos = [int]($dataOff + $valueOff); if ($pos -ge $b.Length) { continue }
++            $take = [Math]::Min([int][Math]::Min($len,$maxLen), $b.Length-$pos)
++            if ($fmt -eq 0x0404 -and $take -ge 4) { $out[$key] = [BitConverter]::ToUInt32($b,$pos) }
++            elseif ($take -gt 0) {
++                $text = [Text.Encoding]::UTF8.GetString($b,$pos,$take).Trim([char]0).Trim()
++                if ($text) { $out[$key] = $text }
++            }
++        }
++    } catch {}
++    return $out
++}
++
++function Get-ContentRegion([string]$ContentId) {
++    if ([string]::IsNullOrWhiteSpace($ContentId) -or $ContentId.Length -lt 2) { return '' }
++    switch ($ContentId.Substring(0,2).ToUpperInvariant()) { 'UP' {'Américas'} 'EP' {'Europa'} 'JP' {'Japão'} 'HP' {'Ásia'} 'KP' {'Coreia'} default {''} }
++}
++
+ function Get-GameDescriptor([string]$RawPath) {
+     if ([string]::IsNullOrWhiteSpace($RawPath)) { throw 'Caminho vazio.' }
+     $item = Get-Item -LiteralPath $RawPath -ErrorAction Stop
+@@ -185,9 +248,22 @@
+     $isFolder = $item.PSIsContainer
+     $kind = if ($isFolder) {'folder'} elseif ($item.Extension -ieq '.pkg') {'pkg'} elseif ($item.Name -ieq 'eboot.bin' -or $item.Extension -ieq '.elf' -or $item.Extension -ieq '.bin') {'elf'} else {'file'}
+     $name = if ($isFolder) {$item.Name} else {$item.BaseName}
+-    $titleId = ''
+-    $m = [regex]::Match($name.ToUpperInvariant(), '(?:CUSA|PPSA|LAPY|NPXS|NPXX)\d{5}')
+-    if ($m.Success) { $titleId = $m.Value }
++    $meta = @{}
++    if ($isFolder) {
++        $sfo = Join-Path $path 'sce_sys\param.sfo'; if (-not (Test-Path -LiteralPath $sfo)) { $sfo = Join-Path $path 'param.sfo' }
++        $meta = Read-ParamSfo $sfo
++    } elseif ($item.Name -ieq 'eboot.bin' -or $item.Extension -ieq '.elf' -or $item.Extension -ieq '.bin') {
++        $sfo = Join-Path $item.DirectoryName 'sce_sys\param.sfo'; if (-not (Test-Path -LiteralPath $sfo)) { $sfo = Join-Path $item.DirectoryName 'param.sfo' }
++        $meta = Read-ParamSfo $sfo
++    }
++    if ($meta.ContainsKey('TITLE') -and [string]$meta['TITLE']) { $name = [string]$meta['TITLE'] }
++    $titleId = if ($meta.ContainsKey('TITLE_ID')) {[string]$meta['TITLE_ID']} else {''}
++    if (-not $titleId) { $m = [regex]::Match(($path + ' ' + $name).ToUpperInvariant(), '(?:CUSA|PPSA|LAPY|NPXS|NPXX)\d{5}'); if ($m.Success) { $titleId = $m.Value } }
++    $titleId = $titleId.ToUpperInvariant()
++    $contentId = if ($meta.ContainsKey('CONTENT_ID')) {[string]$meta['CONTENT_ID']} else {''}
++    $appVer = if ($meta.ContainsKey('APP_VER')) {[string]$meta['APP_VER']} elseif ($meta.ContainsKey('VERSION')) {[string]$meta['VERSION']} else {''}
++    $category = if ($meta.ContainsKey('CATEGORY')) {[string]$meta['CATEGORY']} else {''}
++    $gameId = if ($titleId -match '^CUSA\d{5}$') { Get-TextId ("ps4:" + $titleId) } else { Get-StableId $path }
+     $platform = 'Auto'
+     $probe = ($titleId + ' ' + $name).ToUpperInvariant()
+     if ($probe -match 'PPSA|PS5') { $platform='PS5' }
+@@ -195,10 +271,10 @@
+     elseif ($kind -eq 'pkg') { $platform='PKG' }
+     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+     return [pscustomobject]@{
+-        id=(Get-StableId $path); path=$path; title=$name; title_id=$titleId; content_id='';
++        id=$gameId; path=$path; title=$name; title_id=$titleId; content_id=$contentId;
+         platform=$platform; kind=$kind; size=$(if($isFolder){0L}else{[int64]$item.Length});
+         favorite=$false; last_played=0; play_seconds=0; added_at=$now; icon='';
+-        status=$(if($kind -eq 'pkg'){'Precisa instalar/extrair'}else{'Pronto'}); profile_override='global'
++        status=$(if($kind -eq 'pkg'){'Precisa instalar/extrair'}else{'Pronto'}); profile_override='global'; ps4_boot_mode='auto'; cusa=($titleId -match '^CUSA\d{5}$'); app_ver=$appVer; region=(Get-ContentRegion $contentId); system_ver=''; category=$category
+     }
+ }
+ 
+@@ -212,6 +288,7 @@
+             if ($g.PSObject.Properties.Name -contains 'favorite') { $game.favorite = [bool]$g.favorite }
+             if ($g.PSObject.Properties.Name -contains 'play_seconds') { $game.play_seconds = [int64]$g.play_seconds }
+             if ($g.PSObject.Properties.Name -contains 'profile_override') { $game.profile_override = [string]$g.profile_override }
++            if ($g.PSObject.Properties.Name -contains 'ps4_boot_mode') { $game.ps4_boot_mode = [string]$g.ps4_boot_mode }
+             [void]$out.Add($game); $replaced=$true
+         } else { [void]$out.Add($g) }
+     }
+@@ -220,6 +297,21 @@
+     return $game
+ }
+ 
++function Scan-CusaRoot([string]$RootPath) {
++    if (-not (Test-Path -LiteralPath $RootPath -PathType Container)) { throw 'Raiz CUSA inválida.' }
++    $dirs = New-Object System.Collections.ArrayList
++    $rootItem = Get-Item -LiteralPath $RootPath
++    if ($rootItem.Name -match '^CUSA\d{5}$') { [void]$dirs.Add($rootItem.FullName) }
++    Get-ChildItem -LiteralPath $RootPath -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^CUSA\d{5}$' } | Select-Object -First 500 | ForEach-Object { [void]$dirs.Add($_.FullName) }
++    $out = New-Object System.Collections.ArrayList
++    foreach ($dir in ($dirs | Select-Object -Unique)) {
++        if ((Test-Path -LiteralPath (Join-Path $dir 'eboot.bin')) -or (Test-Path -LiteralPath (Join-Path $dir 'sce_sys\param.sfo'))) {
++            try { [void]$out.Add((Add-Game $dir)) } catch {}
++        }
++    }
++    return @($out)
++}
++
+ function Select-ImportPath([string]$Kind) {
+     Add-Type -AssemblyName System.Windows.Forms
+     if ($Kind -eq 'folder') {
+@@ -263,16 +355,24 @@
+     if ($platform -eq 'PS4') {
+         $exe = Find-Engine 'shadps4'
+         if (-not $exe) { throw 'Core PS4 não configurado. Informe shadPS4.exe em Configurações.' }
+-        $target = $path
+-        if (Test-Path -LiteralPath $path -PathType Container) {
+-            $target = Join-Path $path 'eboot.bin'
+-            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+-                $found = Get-ChildItem -LiteralPath $path -Filter eboot.bin -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+-                if (-not $found) { throw 'Nenhum eboot.bin encontrado na pasta PS4.' }
+-                $target = $found.FullName
++        $mode = if ($game.PSObject.Properties.Name -contains 'ps4_boot_mode') {[string]$game.ps4_boot_mode} else {[string]$cfg.ps4_boot_mode}
++        $titleId = ([string]$game.title_id).ToUpperInvariant()
++        if ($mode -eq 'cusa' -and $titleId -match '^CUSA\d{5}$') {
++            $args.Add($titleId)
++        } else {
++            $target = $path
++            if (Test-Path -LiteralPath $path -PathType Container) {
++                $target = Join-Path $path 'eboot.bin'
++                if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
++                    $found = Get-ChildItem -LiteralPath $path -Filter eboot.bin -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
++                    if (-not $found) { throw 'Nenhum eboot.bin encontrado na pasta PS4.' }
++                    $target = $found.FullName
++                }
+             }
++            $args.Add($target)
+         }
+-        $args.Add($target); $engine='shadPS4'
++        if ([bool]$cfg.fullscreen) { $args.Add('--fullscreen'); $args.Add('true') }
++        $engine='shadPS4'
+     } else {
+         $exe = Find-Engine 'kyty'
+         if (-not $exe) { throw 'kyty_emulator.exe não foi encontrado. Compile/configure o core PS5.' }
+@@ -340,6 +440,8 @@
+ function Handle-Get($Context) {
+     $u=$Context.Request.Url; $path=$u.AbsolutePath
+     if ($path -eq '/api/status') { Send-Json $Context (Get-SystemStatus); return }
++    if ($path -eq '/api/vulkan') { Send-Json $Context (Get-VulkanProbe); return }
++    if ($path -eq '/api/cusa') { $games=@(Get-Library | Where-Object {[string]$_.title_id -match '^CUSA\d{5}$'}); Send-Json $Context ([pscustomobject]@{count=$games.Count;games=$games}); return }
+     if ($path -eq '/api/diagnostics') { Send-Json $Context (Get-Diagnostics); return }
+     if ($path -eq '/api/library') { Send-Json $Context @(Get-Library); return }
+     if ($path -eq '/api/settings') { Send-Json $Context (Get-Settings); return }
+@@ -369,6 +471,7 @@
+         $value=Select-ImportPath ([string]$body.kind); if (-not $value) { Send-Json $Context ([pscustomobject]@{ok=$true;cancelled=$true}); return }
+         $g=Add-Game $value; Send-Json $Context ([pscustomobject]@{ok=$true;game=$g}); return
+     }
++    if ($path -eq '/api/scan-cusa') { $value=Select-ImportPath 'folder'; if(-not $value){Send-Json $Context ([pscustomobject]@{ok=$false;cancelled=$true});return}; $games=@(Scan-CusaRoot $value); Send-Json $Context ([pscustomobject]@{ok=$true;path=$value;count=$games.Count;games=$games}); return }
+     if ($path -eq '/api/launch') { Send-Json $Context (Start-Game ([string]$body.id)); return }
+     if ($path -eq '/api/game-profile') {
+         $profile=[string]$body.profile; if(@('global','stable','balanced','turbo') -notcontains $profile){throw 'Perfil de jogo inválido.'}
+@@ -376,6 +479,7 @@
+         foreach($g in $items){if([string]$g.id -eq [string]$body.id){if($g.PSObject.Properties.Name -contains 'profile_override'){$g.profile_override=$profile}else{$g|Add-Member -NotePropertyName profile_override -NotePropertyValue $profile};$game=$g;break}}
+         if(-not $game){throw 'Jogo não encontrado.'}; Save-JsonFile $LibraryFile @($items); Send-Json $Context ([pscustomobject]@{ok=$true;game=$game}); return
+     }
++    if ($path -eq '/api/game-boot-mode') { $mode=[string]$body.mode; if(@('auto','eboot','cusa') -notcontains $mode){throw 'Modo PS4 inválido.'}; $items=Get-Library; $game=$null; foreach($g in $items){if([string]$g.id -eq [string]$body.id){if($g.PSObject.Properties.Name -contains 'ps4_boot_mode'){$g.ps4_boot_mode=$mode}else{$g|Add-Member -NotePropertyName ps4_boot_mode -NotePropertyValue $mode};$game=$g;break}}; if(-not $game){throw 'Jogo não encontrado.'}; Save-JsonFile $LibraryFile @($items); Send-Json $Context ([pscustomobject]@{ok=$true;game=$game}); return }
+     if ($path -eq '/api/favorite') {
+         $items=Get-Library; $game=$null
+         foreach($g in $items){if([string]$g.id -eq [string]$body.id){$g.favorite=-not [bool]$g.favorite;$game=$g;break}}
+@@ -389,6 +493,7 @@
+         if(@('Fifo','Mailbox','Immediate') -notcontains [string]$cfg.present_mode){$cfg.present_mode='Fifo'}
+         if(@('None','Size','Performance') -notcontains [string]$cfg.shader_optimization){$cfg.shader_optimization='Performance'}
+         if(@('stable','balanced','turbo','custom') -notcontains [string]$cfg.performance_profile){$cfg.performance_profile='balanced'}
++        if(@('auto','eboot','cusa') -notcontains [string]$cfg.ps4_boot_mode){$cfg.ps4_boot_mode='auto'}
+         $cfg.vblank_frequency=[Math]::Max(30,[Math]::Min(360,[int]$cfg.vblank_frequency)); $cfg.gpu_index=[Math]::Max(-1,[int]$cfg.gpu_index)
+         Save-JsonFile $SettingsFile $cfg; Send-Json $Context ([pscustomobject]@{ok=$true;settings=$cfg}); return
+     }
+@@ -411,7 +516,7 @@
+ if(-not $bound){throw "Não foi possível abrir uma porta local entre $Port e $($Port+10)."}
+ $url="http://127.0.0.1:$Port/"
+ Write-Host ''
+-Write-Host ' PKG_DoW 2.1 - UX local (PowerShell fallback)' -ForegroundColor Cyan
++Write-Host ' PKG_DoW 2.2 - UX local (PowerShell fallback)' -ForegroundColor Cyan
+ Write-Host " $url"
+ Write-Host ' Feche esta janela para encerrar a UX.'
+ Write-Host ''
+--- a/tools/test_pkg_dow_server.py
++++ b/tools/test_pkg_dow_server.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import importlib.util
++import os
+ import struct
+ import tempfile
+ from pathlib import Path
+@@ -56,6 +57,38 @@
+         assert item["kind"] == "pkg" and item["platform"] == "PS4", item
+         assert item["status"] == "Precisa instalar/extrair", item
+ 
++        # CUSA folder integration: title ID fallback, registry scan and per-game metadata.
++        cusa_root = base / "games"
++        game_dir = cusa_root / "CUSA01234"
++        (game_dir / "sce_sys").mkdir(parents=True)
++        cusa_sfo = build_sfo().replace(b"PPSA99999", b"CUSA01234")
++        (game_dir / "sce_sys" / "param.sfo").write_bytes(cusa_sfo)
++        (game_dir / "eboot.bin").write_bytes(b"ELF")
++        old_library = server.LIBRARY_FILE
++        server.LIBRARY_FILE = base / "library.json"
++        try:
++            cusa_item = server.describe_import(str(game_dir))
++            assert cusa_item["title_id"] == "CUSA01234", cusa_item
++            assert cusa_item["platform"] == "PS4" and cusa_item["cusa"], cusa_item
++            scanned = server.scan_cusa_root(str(cusa_root))
++            assert len(scanned) == 1 and scanned[0]["title_id"] == "CUSA01234", scanned
++            assert scanned[0]["id"] == cusa_item["id"], (scanned[0], cusa_item)
++            moved = base / "other" / "CUSA01234"
++            (moved / "sce_sys").mkdir(parents=True)
++            (moved / "sce_sys" / "param.sfo").write_bytes(cusa_sfo)
++            (moved / "eboot.bin").write_bytes(b"ELF")
++            moved_item = server.describe_import(str(moved))
++            assert moved_item["id"] == cusa_item["id"], (moved_item, cusa_item)
++        finally:
++            server.LIBRARY_FILE = old_library
++
++        # CLI capability discovery follows the installed shadPS4 build instead of guessing flags.
++        fake = base / "fake_shad"
++        fake.write_text("#!/bin/sh\necho 'Usage: shadPS4 --fullscreen --gpu-id --present-mode -g'\n", encoding="utf-8")
++        fake.chmod(0o755)
++        opts = server.engine_cli_options(str(fake))
++        assert {"--fullscreen", "--gpu-id", "--present-mode", "-g"}.issubset(opts), opts
++
+     print("PKG_DoW server tests: PASS")
+     return 0
+ 
+--- a/webui/index.html
++++ b/webui/index.html
+@@ -50,7 +50,7 @@
+     </section>
+ 
+     <section id="page-library" class="page">
+-      <div class="page-heading"><div><small>COLEÇÃO LOCAL</small><h1>Biblioteca</h1><p>Seus jogos ficam no seu disco. O launcher só guarda caminhos e metadados.</p></div><div class="actions"><button class="secondary" id="importFolderLib">+ Pasta extraída</button><button class="primary" id="importFileLib">+ Importar jogo</button></div></div>
++      <div class="page-heading"><div><small>COLEÇÃO LOCAL</small><h1>Biblioteca</h1><p>Seus jogos ficam no seu disco. O launcher só guarda caminhos e metadados.</p></div><div class="actions"><button class="secondary" id="scanCusaLib">⌕ Escanear CUSA</button><button class="secondary" id="importFolderLib">+ Pasta extraída</button><button class="primary" id="importFileLib">+ Importar jogo</button></div></div>
+       <div id="libraryGrid" class="library-grid"></div>
+     </section>
+ 
+@@ -61,7 +61,7 @@
+       <div class="page-heading"><div><small>IMPORTAÇÃO</small><h1>Adicionar jogos</h1><p>Importe PKG para catalogar ou selecione uma pasta/ELF já instalado ou extraído para executar.</p></div></div>
+       <div class="two-cols">
+         <div class="feature-card panel"><div class="feature-icon">📦</div><h2>Arquivo PKG</h2><p>Detecta metadados sem descriptografar o conteúdo. PKGs de PS4 precisam ser instalados por um core PS4 compatível antes do boot.</p><button id="importPkg" class="primary full">Selecionar PKG / ELF</button></div>
+-        <div class="feature-card panel"><div class="feature-icon">📁</div><h2>Pasta do jogo</h2><p>Recomendado. Procura <code>sce_sys/param.sfo</code>, capa local e <code>eboot.bin</code>. PS5 usa Kyty; PS4 pode usar um shadPS4 configurado.</p><button id="importFolder" class="secondary full">Selecionar pasta</button></div>
++        <div class="feature-card panel"><div class="feature-icon">📁</div><h2>Pasta do jogo / CUSA</h2><p>Procura <code>sce_sys/param.sfo</code>, CUSA, versão, Content ID, capa e <code>eboot.bin</code>. Para uma coleção inteira, use o scanner CUSA.</p><div class="inline-actions"><button id="importFolder" class="secondary full">Selecionar pasta</button><button id="scanCusa" class="secondary full">Escanear raiz CUSA</button></div></div>
+       </div>
+       <div class="notice"><b>Importante:</b> este pacote não contém jogos, chaves, firmware ou conteúdo protegido. Use apenas dumps que você tenha direito de usar.</div>
+     </section>
+@@ -70,27 +70,27 @@
+       <div class="page-heading"><div><small>AJUSTES</small><h1>Configurações</h1><p>Perfis seguros primeiro. “Performance máxima” sem medição é só superstição com eletricidade.</p></div><button id="saveSettings" class="primary">Salvar</button></div>
+       <div class="settings-grid">
+         <div class="settings-card panel"><h2>Perfil de desempenho</h2><label>Preset<select id="performanceProfile"><option value="stable">Estável</option><option value="balanced">Balanceado</option><option value="turbo">Turbo</option><option value="custom">Personalizado</option></select></label><div class="profile-hint" id="profileHint">Equilíbrio entre estabilidade, cache e FPS.</div><button id="applyProfile" class="secondary full">Aplicar preset</button></div>
+-        <div class="settings-card panel"><h2>Engines</h2><label>KytyPS5 / PS5 <input id="kytyPath" placeholder="C:\...\kyty_emulator.exe"></label><label>shadPS4 / PS4 <input id="shadPath" placeholder="C:\...\shadPS4.exe"></label><div class="inline-actions"><button id="openPS5" class="secondary">Abrir PS5</button><button id="openPS4" class="secondary">Abrir PS4</button></div></div>
++        <div class="settings-card panel"><h2>Engines</h2><label>KytyPS5 / PS5 <input id="kytyPath" placeholder="C:\...\kyty_emulator.exe"></label><label>shadPS4 / PS4 <input id="shadPath" placeholder="C:\...\shadPS4.exe"></label><label>Boot PS4 padrão<select id="ps4BootMode"><option value="auto">Auto / eboot confiável</option><option value="eboot">Forçar eboot.bin</option><option value="cusa">CUSA pela biblioteca shadPS4</option></select></label><p class="muted">CUSA direto usa o modo oficial do shadPS4 e pressupõe que a pasta do jogo já esteja registrada nele. Auto usa o ELF local para não depender dessa lista.</p><div class="inline-actions"><button id="openPS5" class="secondary">Abrir PS5</button><button id="openPS4" class="secondary">Abrir PS4</button></div></div>
+         <div class="settings-card panel"><h2>Renderização</h2><label>Present mode<select id="presentMode"><option>Fifo</option><option>Mailbox</option><option>Immediate</option></select></label><label>Shader optimization<select id="shaderOpt"><option>None</option><option>Size</option><option>Performance</option></select></label><label>Resolução<select id="resolution"><option>960x540</option><option>1280x720</option><option>1600x900</option><option>1920x1080</option><option>2560x1440</option></select></label><label>VBlank virtual<input id="vblankFrequency" type="number" min="30" max="360" value="60"></label><label class="toggle-line"><span>Tela cheia</span><input id="fullscreen" type="checkbox"></label></div>
+-        <div class="settings-card panel"><h2>Compatibilidade</h2><label>GPU Vulkan (-1 = auto)<input id="gpuIndex" type="number" value="-1" min="-1"></label><label>Nome do jogador<input id="playerName" maxlength="16"></label><label class="toggle-line"><span>Proteção SysV red zone (Windows)</span><input id="redzone" type="checkbox"></label><label class="toggle-line"><span>Fallback PlayGo</span><input id="playgoHack" type="checkbox"></label><p class="muted">Validação Vulkan/GPU continua desligada nos presets de jogo. Ela é excelente para caçar bugs e igualmente excelente para assassinar frame time.</p></div>
++        <div class="settings-card panel"><h2>Compatibilidade</h2><label>GPU Vulkan<select id="gpuIndex"><option value="-1">Auto — melhor GPU compatível</option></select></label><div id="gpuHint" class="profile-hint compact">O launcher consulta o Vulkan diretamente, sem depender do SDK.</div><label>Nome do jogador<input id="playerName" maxlength="16"></label><label class="toggle-line"><span>Proteção SysV red zone (Windows)</span><input id="redzone" type="checkbox"></label><label class="toggle-line"><span>Fallback PlayGo</span><input id="playgoHack" type="checkbox"></label><p class="muted">Validação Vulkan/GPU continua desligada nos presets de jogo. Ela é excelente para caçar bugs e igualmente excelente para assassinar frame time.</p></div>
+       </div>
+     </section>
+ 
+     <section id="page-controls" class="page"><div class="page-heading"><div><small>INPUT</small><h1>Controles</h1><p>Mapeamento detalhado continua no core. Esta UX evita inventar um driver de gamepad em JavaScript, por razões de sanidade.</p></div></div><div class="feature-card panel wide"><div class="controller-big">🎮</div><h2>DualSense / XInput</h2><p>Conecte o controle antes de iniciar o jogo. O Kyty expõe <code>--keymap Control=Input</code> para remapeamentos avançados.</p></div></section>
+ 
+-    <section id="page-system" class="page"><div class="page-heading"><div><small>DIAGNÓSTICO</small><h1>Sistema</h1><p>Status do launcher, engines, Vulkan, cache e armazenamento.</p></div><div class="actions"><button id="runDiagnostics" class="primary">Executar diagnóstico</button><button id="refreshStatus" class="secondary">Atualizar</button></div></div><div id="diagnosticCards" class="diag-grid"></div><div id="diagnosticChecks" class="check-grid"></div><div class="settings-card panel"><div class="section-title"><h2>Logs recentes</h2><button id="openPipelineCache" class="ghost">Abrir cache Vulkan</button></div><div id="logsList" class="logs"></div></div></section>
++    <section id="page-system" class="page"><div class="page-heading"><div><small>DIAGNÓSTICO</small><h1>Sistema</h1><p>Status do launcher, engines, Vulkan, extensões exigidas pelo PS4, cache e armazenamento.</p></div><div class="actions"><button id="probeVulkan" class="secondary">Reprovar Vulkan</button><button id="runDiagnostics" class="primary">Executar diagnóstico</button><button id="refreshStatus" class="secondary">Atualizar</button></div></div><div id="diagnosticCards" class="diag-grid"></div><div id="vulkanAdapters" class="vulkan-grid"></div><div id="diagnosticChecks" class="check-grid"></div><div class="settings-card panel"><div class="section-title"><h2>Logs recentes</h2><button id="openPipelineCache" class="ghost">Abrir cache Vulkan</button></div><div id="logsList" class="logs"></div></div></section>
+     <section id="page-support" class="page"><div class="page-heading"><div><small>RELATÓRIO TÉCNICO</small><h1>Suporte</h1><p>O pacote inclui a auditoria completa e o relatório de arquitetura na pasta <code>docs</code>.</p></div></div><div class="two-cols"><div class="feature-card panel"><div class="feature-icon">🧪</div><h2>Verificar biblioteca</h2><p>Confere se os caminhos importados ainda existem.</p><button id="verifyBtn" class="secondary full">Verificar integridade</button></div><div class="feature-card panel"><div class="feature-icon">🧹</div><h2>Limpar cache da UX</h2><p>Remove apenas cache temporário desta interface. Não apaga shader cache do core.</p><button id="cleanCacheBtn" class="secondary full">Limpar cache</button></div></div></section>
+   </main>
+ 
+   <aside class="rightbar">
+     <div class="panel system-widget"><h3>Sistema</h3><div class="gauges"><div class="gauge"><div class="gauge-ring" style="--p:28"><span>CPU<b id="cpuGauge">--</b></span></div></div><div class="gauge"><div class="gauge-ring" style="--p:42"><span>RAM<b id="ramGauge">--</b></span></div></div><div class="gauge"><div class="gauge-ring" style="--p:63"><span>DISK<b id="diskGauge">--</b></span></div></div></div><div class="storage"><div><span>Armazenamento</span><b id="storageText">--</b></div><div class="bar"><i id="storageBar"></i></div></div></div>
+     <div class="panel quick"><h3>Ações Rápidas</h3><button id="openGames"><span>▱</span>Abrir Pasta do Projeto</button><button id="verifyQuick"><span>◆</span>Verificar Integridade</button><button id="diagQuick"><span>◈</span>Diagnóstico de Boot</button><button id="cacheQuick"><span>⚡</span>Cache Vulkan</button><button id="importQuick"><span>⇩</span>Importar Jogo</button><button data-page-jump="settings"><span>🎮</span>Configurar Engines</button></div>
+-    <div class="panel news"><div class="news-head"><h3>Boost v2</h3><i></i></div><div class="news-box"><strong>Camada de performance revisada</strong><p>PKG_DoW architecture pass</p><ul><li>Pipeline cache persistente em builds ZIP</li><li>Busca de shaders por chave indexada</li><li>Presets Estável / Balanceado / Turbo</li><li>Monitor de crash, tempo e exit code</li></ul><button data-page-jump="support" class="primary full">Ver Relatório</button></div></div>
++    <div class="panel news"><div class="news-head"><h3>Boost v2.2</h3><i></i></div><div class="news-box"><strong>Camada de performance revisada</strong><p>PKG_DoW architecture pass</p><ul><li>Pipeline cache persistente em builds ZIP</li><li>Busca de shaders por chave indexada</li><li>Presets Estável / Balanceado / Turbo</li><li>Monitor de crash, tempo e exit code</li><li>CUSA + probe Vulkan 1.3 integrado</li></ul><button data-page-jump="support" class="primary full">Ver Relatório</button></div></div>
+     <footer>PKG_DoW <span>•</span> KytyPS5 mod</footer>
+   </aside>
+ </div>
+ 
+-<div id="gameModal" class="modal"><div class="modal-card panel"><button id="closeModal" class="modal-close">×</button><div id="modalPoster" class="modal-poster">🎮</div><div class="modal-info"><small id="modalPlatform"></small><h2 id="modalTitle"></h2><p id="modalMeta"></p><div id="modalStatus" class="pill"></div><label class="game-profile-line"><span>Perfil deste jogo</span><select id="modalProfile"><option value="global">Usar global</option><option value="stable">Estável</option><option value="balanced">Balanceado</option><option value="turbo">Turbo</option></select></label><div class="modal-actions"><button id="modalPlay" class="primary">▶ Jogar</button><button id="modalFavorite" class="secondary">♡ Favoritar</button><button id="modalFolder" class="secondary">📁 Pasta</button><button id="modalRemove" class="danger">Remover</button></div></div></div></div>
++<div id="gameModal" class="modal"><div class="modal-card panel"><button id="closeModal" class="modal-close">×</button><div id="modalPoster" class="modal-poster">🎮</div><div class="modal-info"><small id="modalPlatform"></small><h2 id="modalTitle"></h2><p id="modalMeta"></p><div id="modalDetails" class="game-details"></div><div id="modalStatus" class="pill"></div><label class="game-profile-line"><span>Perfil deste jogo</span><select id="modalProfile"><option value="global">Usar global</option><option value="stable">Estável</option><option value="balanced">Balanceado</option><option value="turbo">Turbo</option></select></label><label id="modalBootRow" class="game-profile-line"><span>Boot PS4</span><select id="modalBootMode"><option value="auto">Auto / eboot</option><option value="eboot">eboot.bin</option><option value="cusa">CUSA (biblioteca shadPS4)</option></select></label><div class="modal-actions"><button id="modalPlay" class="primary">▶ Jogar</button><button id="modalFavorite" class="secondary">♡ Favoritar</button><button id="modalFolder" class="secondary">📁 Pasta</button><button id="modalRemove" class="danger">Remover</button></div></div></div></div>
+ <script src="app.js"></script>
+ </body>
+ </html>
+--- a/webui/app.js
++++ b/webui/app.js
+@@ -1,31 +1,38 @@
+ const state={library:[],settings:{},status:{},selected:null,page:'home',query:'',diagnostics:[]};
+ const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+-const api=async(path,opts={})=>{const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});let j;try{j=await r.json()}catch{throw new Error(`Resposta inválida (${r.status})`)}if(!r.ok||j?.ok===false&&!j?.cancelled)throw new Error(j?.error||`HTTP ${r.status}`);return j};
++const api=async(path,opts={})=>{const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});let j;try{j=await r.json()}catch{throw new Error(`Resposta inválida (${r.status})`)}if(!r.ok||(j?.ok===false&&!j?.cancelled))throw new Error(j?.error||`HTTP ${r.status}`);return j};
+ const post=(p,b={})=>api(p,{method:'POST',body:JSON.stringify(b)});
+ const fmtBytes=n=>{if(!n)return'--';const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return`${n.toFixed(i>1?1:0)} ${u[i]}`};
+ const fmtTime=s=>{if(!s)return'0h';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h?`${h}h ${m}m`:`${m}m`};
+ const hue=id=>[220,258,280,330,190,25,145][parseInt((id||'1').slice(0,2),16)%7];
+-function toast(msg,error=false){const t=$('#toast');t.textContent=msg;t.className='toast show'+(error?' error':'');clearTimeout(t._timer);t._timer=setTimeout(()=>t.className='toast',3600)}
+-function empty(text='Nenhum jogo importado ainda.'){return`<div class="empty"><div><b>${text}</b>Use “Importar Jogo” para adicionar seu próprio dump.</div></div>`}
+-function card(g,small=false){const art=g.icon?`<img src="${g.icon}" alt="">`:`<span class="game-symbol">${g.platform==='PS4'?'▣':'🎮'}</span>`;return `<article class="${small?'recent-card':'game-card'}" data-game="${g.id}" style="--h:${hue(g.id)}"><div class="game-art">${art}</div>${g.favorite?'<span class="favorite-mark">♥</span>':''}${small?`<span class="playtime">◷ ${fmtTime(g.play_seconds)}</span>`:''}<div class="game-label"><strong>${escapeHtml(g.title)}</strong><small>${escapeHtml(g.title_id||g.platform||g.kind)}</small></div></article>`}
+-function escapeHtml(s=''){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
+-function filtered(list=state.library){const q=state.query.trim().toLowerCase();return q?list.filter(g=>`${g.title} ${g.title_id} ${g.platform}`.toLowerCase().includes(q)):list}
++const escapeHtml=(s='')=>String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
++function toast(msg,error=false){const t=$('#toast');t.textContent=msg;t.className='toast show'+(error?' error':'');clearTimeout(t._timer);t._timer=setTimeout(()=>t.className='toast',3800)}
++function empty(text='Nenhum jogo importado ainda.'){return`<div class="empty"><div><b>${text}</b>Use “Importar Jogo” ou “Escanear CUSA” para adicionar seus próprios dumps.</div></div>`}
++function card(g,small=false){const art=g.icon?`<img src="${g.icon}" alt="">`:`<span class="game-symbol">${g.platform==='PS4'?'▣':'🎮'}</span>`;const badge=g.cusa?`<span class="cusa-badge">${escapeHtml(g.title_id)}</span>`:'';return `<article class="${small?'recent-card':'game-card'}" data-game="${g.id}" style="--h:${hue(g.id)}"><div class="game-art">${art}</div>${badge}${g.favorite?'<span class="favorite-mark">♥</span>':''}${small?`<span class="playtime">◷ ${fmtTime(g.play_seconds)}</span>`:''}<div class="game-label"><strong>${escapeHtml(g.title)}</strong><small>${escapeHtml(g.title_id||g.platform||g.kind)}</small></div></article>`}
++function filtered(list=state.library){const q=state.query.trim().toLowerCase();return q?list.filter(g=>`${g.title} ${g.title_id} ${g.content_id} ${g.platform} ${g.region}`.toLowerCase().includes(q)):list}
+ function renderLibrary(){const all=filtered();$('#libraryGrid').innerHTML=all.length?all.map(g=>card(g)).join(''):empty();const rec=filtered([...state.library].filter(g=>g.last_played).sort((a,b)=>b.last_played-a.last_played));$('#recentGrid').innerHTML=rec.length?rec.map(g=>card(g)).join(''):empty('Nenhuma execução registrada.');const fav=filtered(state.library.filter(g=>g.favorite));$('#favoriteGrid').innerHTML=fav.length?fav.map(g=>card(g)).join(''):empty('Nenhum favorito ainda.');$('#homeLibrary').innerHTML=all.length?all.slice(0,5).map(g=>card(g)).join(''):empty();$('#homeRecent').innerHTML=rec.length?rec.slice(0,5).map(g=>card(g,true)).join(''):empty('Jogue algo para aparecer aqui.');$$('[data-game]').forEach(el=>el.onclick=()=>openGame(el.dataset.game))}
+-function renderStatus(){const s=state.status,total=s.ram_total||0,used=s.ram_used||0,ram=total?Math.round(used/total*100):0,disk=s.disk_total?Math.round(s.disk_used/s.disk_total*100):0;$('#cpuGauge').textContent=`${s.cpu_threads||'--'}T`;$('#ramGauge').textContent=total?`${ram}%`:'--';$('#diskGauge').textContent=s.disk_total?`${disk}%`:'--';$('.gauge:nth-child(1) .gauge-ring')?.style.setProperty('--p',Math.min(100,(s.cpu_threads||8)*4));$('.gauge:nth-child(2) .gauge-ring')?.style.setProperty('--p',ram);$('.gauge:nth-child(3) .gauge-ring')?.style.setProperty('--p',disk);$('#storageText').textContent=`${fmtBytes(s.disk_used)} / ${fmtBytes(s.disk_total)}`;$('#storageBar').style.width=`${disk}%`;const cores=[];if(s.engines?.kyty)cores.push('PS5');if(s.engines?.shadps4)cores.push('PS4');$('#coreStatusText').textContent=cores.length?`Core ${cores.join(' + ')} pronto`:'Core não compilado/configurado';const active=Object.keys(s.active_processes||{}).length,cache=s.pipeline_cache||{};const items=[['CPU',s.cpu_name||'Desconhecida',`${s.cpu_threads||'?'} threads`],['RAM',fmtBytes(s.ram_total),`${fmtBytes(s.ram_used)} em uso`],['Vulkan',s.vulkan_runtime?'Runtime pronto':'Runtime não detectado',s.vulkan_runtime?'Loader disponível':'Instale/atualize o driver da GPU'],['Cache Vulkan',fmtBytes(cache.size||0),`${cache.files||0} arquivo(s) persistente(s)`],['KytyPS5',s.engines?.kyty?'Encontrado':'Não encontrado',s.engines?.kyty||'Configure o executável'],['shadPS4',s.engines?.shadps4?'Encontrado':'Não configurado',s.engines?.shadps4||'Opcional para jogos PS4'],['Processos',active?`${active} em execução`:'Nenhum ativo',active?'Monitorando exit code e tempo':'Pronto'],['Disco',fmtBytes(s.disk_total),`${disk}% usado`]];$('#diagnosticCards').innerHTML=items.map(([a,b,c])=>`<div class="diag-card"><small>${escapeHtml(a)}</small><b>${escapeHtml(b)}</b><span>${escapeHtml(c)}</span></div>`).join('')}
++function vulkanGpus(){return state.status?.vulkan?.gpus||[]}
++function renderGpuOptions(){const select=$('#gpuIndex');if(!select)return;const current=String(state.settings.gpu_index??-1);const gpus=vulkanGpus();select.innerHTML='<option value="-1">Auto — melhor GPU compatível</option>'+gpus.map(g=>`<option value="${g.index}">GPU ${g.index} — ${escapeHtml(g.name)} (${escapeHtml(g.type)})</option>`).join('');select.value=[...select.options].some(o=>o.value===current)?current:'-1';updateGpuHint()}
++function updateGpuHint(){const hint=$('#gpuHint'),idx=Number($('#gpuIndex')?.value??-1),g=vulkanGpus().find(x=>Number(x.index)===idx);if(!hint)return;if(!g){const ready=vulkanGpus().filter(x=>x.shadps4_ready);hint.textContent=vulkanGpus().length?`Auto escolhe a melhor GPU. ${ready.length}/${vulkanGpus().length} adaptador(es) atendem Vulkan 1.3 + extensões do shadPS4.`:'Nenhum adaptador enumerado. O driver Vulkan precisa expor uma GPU ao loader.';return}hint.textContent=`${g.name} • Vulkan ${g.api_version} • ${g.type} • ${fmtBytes(g.vram)} local • PS4 ${g.shadps4_ready?'pronto':'faltam requisitos/extensões'}`}
++function renderVulkanAdapters(){const box=$('#vulkanAdapters');if(!box)return;const vk=state.status.vulkan||{},gpus=vk.gpus||[];if(!gpus.length){box.innerHTML=`<div class="vulkan-card bad"><div><small>Vulkan</small><b>Nenhuma GPU enumerada</b></div><span>${escapeHtml(vk.error||'Loader/driver não respondeu ao probe.')}</span></div>`;return}box.innerHTML=gpus.map(g=>`<div class="vulkan-card ${g.shadps4_ready?'ok':'warn'}"><div class="vk-head"><span class="gpu-index">GPU ${g.index}</span><b>${escapeHtml(g.name)}</b></div><div class="vk-spec"><span>${escapeHtml(g.type)}</span><span>Vulkan ${escapeHtml(g.api_version)}</span><span>${fmtBytes(g.vram)}</span></div><div class="vk-ext"><i class="${g.swapchain?'yes':'no'}">swapchain</i><i class="${g.push_descriptor?'yes':'no'}">push descriptor</i><i class="${g.shadps4_ready?'yes':'no'}">shadPS4 ${g.shadps4_ready?'ready':'check'}</i></div></div>`).join('')}
++function renderStatus(){const s=state.status,total=s.ram_total||0,used=s.ram_used||0,ram=total?Math.round(used/total*100):0,disk=s.disk_total?Math.round(s.disk_used/s.disk_total*100):0;$('#cpuGauge').textContent=`${s.cpu_threads||'--'}T`;$('#ramGauge').textContent=total?`${ram}%`:'--';$('#diskGauge').textContent=s.disk_total?`${disk}%`:'--';$('.gauge:nth-child(1) .gauge-ring')?.style.setProperty('--p',Math.min(100,(s.cpu_threads||8)*4));$('.gauge:nth-child(2) .gauge-ring')?.style.setProperty('--p',ram);$('.gauge:nth-child(3) .gauge-ring')?.style.setProperty('--p',disk);$('#storageText').textContent=`${fmtBytes(s.disk_used)} / ${fmtBytes(s.disk_total)}`;$('#storageBar').style.width=`${disk}%`;const cores=[];if(s.engines?.kyty)cores.push('PS5');if(s.engines?.shadps4)cores.push('PS4');$('#coreStatusText').textContent=cores.length?`Core ${cores.join(' + ')} pronto`:'Core não compilado/configurado';const active=Object.keys(s.active_processes||{}).length,cache=s.pipeline_cache||{},vk=s.vulkan||{},ready=(vk.gpus||[]).filter(g=>g.shadps4_ready).length;const items=[['CPU',s.cpu_name||'Desconhecida',`${s.cpu_threads||'?'} threads`],['RAM',fmtBytes(s.ram_total),`${fmtBytes(s.ram_used)} em uso`],['Vulkan',s.vulkan_runtime?`Loader ${vk.loader_version||'pronto'}`:'Runtime não utilizável',`${(vk.gpus||[]).length} GPU(s), ${ready} pronta(s) para PS4`],['Cache Vulkan',fmtBytes(cache.size||0),`${cache.files||0} arquivo(s) encontrado(s)`],['KytyPS5',s.engines?.kyty?'Encontrado':'Não encontrado',s.engines?.kyty||'Configure o executável'],['shadPS4',s.engines?.shadps4?'Encontrado':'Não configurado',s.engines?.shadps4||'Necessário para CUSA/PS4'],['CUSA',`${state.library.filter(g=>g.cusa).length} título(s)`,`Serial + versão + região integrados`],['Processos',active?`${active} em execução`:'Nenhum ativo',active?'Monitorando exit code e tempo':'Pronto'],['Disco',fmtBytes(s.disk_total),`${disk}% usado`]];$('#diagnosticCards').innerHTML=items.map(([a,b,c])=>`<div class="diag-card"><small>${escapeHtml(a)}</small><b>${escapeHtml(b)}</b><span>${escapeHtml(c)}</span></div>`).join('');renderGpuOptions();renderVulkanAdapters()}
+ function showPage(name){state.page=name;$$('.page').forEach(p=>p.classList.remove('active'));$(`#page-${name}`)?.classList.add('active');$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.page===name));if(name==='system')loadLogs();window.scrollTo({top:0,behavior:'smooth'})}
+ async function refresh(){try{const [lib,sett,status]=await Promise.all([api('/api/library'),api('/api/settings'),api('/api/status')]);state.library=lib;state.settings=sett;state.status=status;fillSettings();renderLibrary();renderStatus()}catch(e){toast(e.message,true)}}
+-function fillSettings(){const s=state.settings;$('#kytyPath').value=s.kyty_path||'';$('#shadPath').value=s.shadps4_path||'';$('#performanceProfile').value=s.performance_profile||'balanced';$('#presentMode').value=s.present_mode||'Fifo';$('#shaderOpt').value=s.shader_optimization||'Performance';$('#resolution').value=s.resolution||'1280x720';$('#vblankFrequency').value=s.vblank_frequency||60;$('#fullscreen').checked=!!s.fullscreen;$('#redzone').checked=s.redzone!==false;$('#playgoHack').checked=!!s.playgo_hack;$('#gpuIndex').value=s.gpu_index??-1;$('#playerName').value=s.player_name||'Player1';$('#profileName').textContent=s.player_name||'Player1';$('#heroName').textContent=s.player_name||'Player1';updateProfileHint()}
+-async function saveSettings(){try{const body={kyty_path:$('#kytyPath').value.trim(),shadps4_path:$('#shadPath').value.trim(),performance_profile:$('#performanceProfile').value,present_mode:$('#presentMode').value,shader_optimization:$('#shaderOpt').value,resolution:$('#resolution').value,vblank_frequency:Number($('#vblankFrequency').value),fullscreen:$('#fullscreen').checked,redzone:$('#redzone').checked,playgo_hack:$('#playgoHack').checked,gpu_index:Number($('#gpuIndex').value),player_name:$('#playerName').value.trim()||'Player1'};const r=await post('/api/settings',body);state.settings=r.settings;fillSettings();state.status=await api('/api/status');renderStatus();toast('Configurações salvas.')}catch(e){toast(e.message,true)}}
+-const profiles={stable:{present:'Fifo',shader:'None',resolution:'1280x720',vblank:60,redzone:true,playgo:false,hint:'Prioriza compatibilidade e frame pacing. Ideal para primeiro boot.'},balanced:{present:'Fifo',shader:'Performance',resolution:'1280x720',vblank:60,redzone:true,playgo:false,hint:'Equilíbrio entre estabilidade, cache e FPS. Recomendado.'},turbo:{present:'Mailbox',shader:'Performance',resolution:'960x540',vblank:60,redzone:true,playgo:false,hint:'Reduz carga de GPU e tenta menor latência. Mailbox depende do driver.'},custom:{hint:'Ajustes manuais. A responsabilidade, tradicionalmente, volta ao ser humano.'}};
++function fillSettings(){const s=state.settings;$('#kytyPath').value=s.kyty_path||'';$('#shadPath').value=s.shadps4_path||'';$('#performanceProfile').value=s.performance_profile||'balanced';$('#presentMode').value=s.present_mode||'Fifo';$('#shaderOpt').value=s.shader_optimization||'Performance';$('#resolution').value=s.resolution||'1280x720';$('#vblankFrequency').value=s.vblank_frequency||60;$('#fullscreen').checked=!!s.fullscreen;$('#redzone').checked=s.redzone!==false;$('#playgoHack').checked=!!s.playgo_hack;$('#ps4BootMode').value=s.ps4_boot_mode||'auto';$('#playerName').value=s.player_name||'Player1';$('#profileName').textContent=s.player_name||'Player1';$('#heroName').textContent=s.player_name||'Player1';updateProfileHint();renderGpuOptions()}
++async function saveSettings(){try{const body={kyty_path:$('#kytyPath').value.trim(),shadps4_path:$('#shadPath').value.trim(),performance_profile:$('#performanceProfile').value,present_mode:$('#presentMode').value,shader_optimization:$('#shaderOpt').value,resolution:$('#resolution').value,vblank_frequency:Number($('#vblankFrequency').value),fullscreen:$('#fullscreen').checked,redzone:$('#redzone').checked,playgo_hack:$('#playgoHack').checked,gpu_index:Number($('#gpuIndex').value),player_name:$('#playerName').value.trim()||'Player1',ps4_boot_mode:$('#ps4BootMode').value};const r=await post('/api/settings',body);state.settings=r.settings;fillSettings();state.status=await api('/api/status');renderStatus();toast('Configurações CUSA/Vulkan salvas.')}catch(e){toast(e.message,true)}}
++const profiles={stable:{present:'Fifo',shader:'None',resolution:'1280x720',vblank:60,redzone:true,playgo:false,hint:'Prioriza compatibilidade e frame pacing. Ideal para primeiro boot.'},balanced:{present:'Fifo',shader:'Performance',resolution:'1280x720',vblank:60,redzone:true,playgo:false,hint:'Equilíbrio entre estabilidade, cache e FPS. Recomendado.'},turbo:{present:'Mailbox',shader:'Performance',resolution:'960x540',vblank:60,redzone:true,playgo:false,hint:'Reduz carga de GPU e tenta menor latência. Mailbox só é usado se a GPU/driver suportar.'},custom:{hint:'Ajustes manuais. O silício não lê pensamentos, infelizmente.'}};
+ function updateProfileHint(){const p=profiles[$('#performanceProfile')?.value]||profiles.custom;const el=$('#profileHint');if(el)el.textContent=p.hint}
+ function applyProfile(){const name=$('#performanceProfile').value,p=profiles[name]||profiles.custom;if(name==='custom')return updateProfileHint();$('#presentMode').value=p.present;$('#shaderOpt').value=p.shader;$('#resolution').value=p.resolution;$('#vblankFrequency').value=p.vblank;$('#redzone').checked=p.redzone;$('#playgoHack').checked=p.playgo;updateProfileHint();toast(`Preset ${name==='stable'?'Estável':name==='balanced'?'Balanceado':'Turbo'} aplicado. Salve para persistir.`)}
+-async function runDiagnostics(){try{const r=await api('/api/diagnostics');state.diagnostics=r.checks||[];const box=$('#diagnosticChecks');box.innerHTML=state.diagnostics.map(x=>`<div class="check-card ${x.ok?'ok':'bad'}"><b>${x.ok?'✓':'!'} ${escapeHtml(x.name)}</b><span>${escapeHtml(x.detail)}</span></div>`).join('');state.status=r.status||state.status;renderStatus();toast(state.diagnostics.every(x=>x.ok)?'Diagnóstico concluído sem bloqueios.':'Diagnóstico encontrou itens que merecem atenção.',!state.diagnostics.every(x=>x.ok))}catch(e){toast(e.message,true)}}
++async function runDiagnostics(){try{const r=await api('/api/diagnostics');state.diagnostics=r.checks||[];$('#diagnosticChecks').innerHTML=state.diagnostics.map(x=>`<div class="check-card ${x.ok?'ok':'bad'}"><b>${x.ok?'✓':'!'} ${escapeHtml(x.name)}</b><span>${escapeHtml(x.detail)}</span></div>`).join('');state.status=r.status||state.status;renderStatus();toast(state.diagnostics.every(x=>x.ok)?'Diagnóstico concluído sem bloqueios.':'Diagnóstico encontrou requisitos ausentes.',!state.diagnostics.every(x=>x.ok))}catch(e){toast(e.message,true)}}
++async function probeVulkan(){try{const vk=await api('/api/vulkan');state.status.vulkan=vk;state.status.vulkan_runtime=!!vk.available;renderStatus();toast(vk.gpus?.length?`Vulkan: ${vk.gpus.length} adaptador(es) enumerado(s).`:vk.error||'Nenhuma GPU Vulkan encontrada.',!vk.gpus?.length)}catch(e){toast(e.message,true)}}
+ async function openPipelineCache(){try{const r=await post('/api/open-pipeline-cache');toast(`Cache Vulkan: ${r.path}`)}catch(e){toast(e.message,true)}}
+ async function doImport(kind='file'){try{const r=await post('/api/import-dialog',{kind});if(r.cancelled)return;toast(`${r.game.title} adicionado à biblioteca.`);await refresh();showPage('library')}catch(e){toast(e.message,true)}}
+-function openGame(id){const g=state.library.find(x=>x.id===id);if(!g)return;state.selected=g;$('#modalTitle').textContent=g.title;$('#modalPlatform').textContent=`${g.platform} • ${g.kind.toUpperCase()}`;$('#modalMeta').textContent=[g.title_id,g.content_id,g.path].filter(Boolean).join('  •  ');$('#modalStatus').textContent=g.status||'Pronto';$('#modalProfile').value=g.profile_override||'global';$('#modalFavorite').textContent=g.favorite?'♥ Favorito':'♡ Favoritar';$('#modalPoster').innerHTML=g.icon?`<img src="${g.icon}" alt="">`:'🎮';$('#gameModal').classList.add('open')}
++async function scanCusa(){try{toast('Escaneando raiz por títulos CUSA…');const r=await post('/api/scan-cusa',{});if(r.cancelled)return;await refresh();showPage('library');toast(`${r.count} título(s) PS4/CUSA encontrado(s).`)}catch(e){toast(e.message,true)}}
++function openGame(id){const g=state.library.find(x=>x.id===id);if(!g)return;state.selected=g;$('#modalTitle').textContent=g.title;$('#modalPlatform').textContent=`${g.platform} • ${String(g.kind).toUpperCase()}${g.cusa?' • CUSA':''}`;$('#modalMeta').textContent=[g.title_id,g.content_id,g.path].filter(Boolean).join('  •  ');const details=[['Versão',g.app_ver],['Região',g.region],['Sistema',g.system_ver],['Categoria',g.category]].filter(([,v])=>v);$('#modalDetails').innerHTML=details.map(([k,v])=>`<span><small>${escapeHtml(k)}</small><b>${escapeHtml(v)}</b></span>`).join('');$('#modalStatus').textContent=g.status||'Pronto';$('#modalProfile').value=g.profile_override||'global';$('#modalFavorite').textContent=g.favorite?'♥ Favorito':'♡ Favoritar';$('#modalPoster').innerHTML=g.icon?`<img src="${g.icon}" alt="">`:'🎮';const isPS4=String(g.platform).toUpperCase()==='PS4';$('#modalBootRow').style.display=isPS4?'flex':'none';$('#modalBootMode').value=g.ps4_boot_mode||'auto';$('#gameModal').classList.add('open')}
+ async function playSelected(){if(!state.selected)return;try{const r=await post('/api/launch',{id:state.selected.id});toast(`Iniciado com ${r.engine} (PID ${r.pid}).`);$('#gameModal').classList.remove('open');await refresh()}catch(e){toast(e.message,true)}}
+ async function favSelected(){if(!state.selected)return;try{const r=await post('/api/favorite',{id:state.selected.id});state.selected=r.game;await refresh();openGame(r.game.id)}catch(e){toast(e.message,true)}}
+ async function saveGameProfile(){if(!state.selected)return;try{const r=await post('/api/game-profile',{id:state.selected.id,profile:$('#modalProfile').value});state.selected=r.game;const i=state.library.findIndex(g=>g.id===r.game.id);if(i>=0)state.library[i]=r.game;toast('Perfil por jogo salvo.')}catch(e){toast(e.message,true)}}
++async function saveBootMode(){if(!state.selected)return;try{const r=await post('/api/game-boot-mode',{id:state.selected.id,mode:$('#modalBootMode').value});state.selected=r.game;const i=state.library.findIndex(g=>g.id===r.game.id);if(i>=0)state.library[i]=r.game;toast('Modo de boot PS4 salvo.')}catch(e){toast(e.message,true)}}
+ async function removeSelected(){if(!state.selected||!confirm(`Remover “${state.selected.title}” da biblioteca? O arquivo do jogo NÃO será apagado.`))return;try{await post('/api/remove',{id:state.selected.id});$('#gameModal').classList.remove('open');await refresh();toast('Removido da biblioteca.')}catch(e){toast(e.message,true)}}
+ async function openSelectedFolder(){if(!state.selected)return;try{await post('/api/open-folder',{path:state.selected.path})}catch(e){toast(e.message,true)}}
+ async function verify(){try{const r=await post('/api/verify');const missing=r.checked.filter(x=>!x.exists).length;toast(missing?`${missing} caminho(s) da biblioteca não existem mais.`:'Biblioteca verificada. Todos os caminhos existem.',!!missing)}catch(e){toast(e.message,true)}}
+@@ -33,6 +40,6 @@
+ async function loadLogs(){try{const logs=await api('/api/logs');$('#logsList').innerHTML=logs.length?logs.map(l=>`<div class="log-row"><span>${escapeHtml(l.name)}</span><b>${fmtBytes(l.size)}</b></div>`).join(''):'<div class="empty">Nenhum log de execução ainda.</div>'}catch(e){toast(e.message,true)}}
+ 
+ $$('.nav-item').forEach(b=>b.onclick=()=>showPage(b.dataset.page));$$('[data-page-jump]').forEach(b=>b.onclick=()=>showPage(b.dataset.pageJump));$('#exploreBtn').onclick=()=>showPage('library');$('#search').oninput=e=>{state.query=e.target.value;renderLibrary()};$('#clearSearch').onclick=()=>{$('#search').value='';state.query='';renderLibrary()};
+-['#importFileLib','#importPkg','#importQuick'].forEach(s=>$(s).onclick=()=>doImport('file'));['#importFolderLib','#importFolder'].forEach(s=>$(s).onclick=()=>doImport('folder'));$('#saveSettings').onclick=saveSettings;$('#applyProfile').onclick=applyProfile;$('#performanceProfile').onchange=updateProfileHint;$('#refreshStatus').onclick=refresh;$('#runDiagnostics').onclick=runDiagnostics;$('#diagQuick').onclick=()=>{showPage('system');runDiagnostics()};$('#openPipelineCache').onclick=openPipelineCache;$('#cacheQuick').onclick=openPipelineCache;$('#closeModal').onclick=()=>$('#gameModal').classList.remove('open');$('#gameModal').onclick=e=>{if(e.target.id==='gameModal')e.currentTarget.classList.remove('open')};$('#modalPlay').onclick=playSelected;$('#modalProfile').onchange=saveGameProfile;$('#modalFavorite').onclick=favSelected;$('#modalRemove').onclick=removeSelected;$('#modalFolder').onclick=openSelectedFolder;$('#verifyBtn').onclick=verify;$('#verifyQuick').onclick=verify;$('#cleanCacheBtn').onclick=clean;$('#openGames').onclick=()=>post('/api/open-folder',{}).catch(e=>toast(e.message,true));$('#openPS5').onclick=()=>post('/api/open-engine',{engine:'kyty'}).catch(e=>toast(e.message,true));$('#openPS4').onclick=()=>post('/api/open-engine',{engine:'shadps4'}).catch(e=>toast(e.message,true));
++['#importFileLib','#importPkg','#importQuick'].forEach(s=>$(s).onclick=()=>doImport('file'));['#importFolderLib','#importFolder'].forEach(s=>$(s).onclick=()=>doImport('folder'));['#scanCusaLib','#scanCusa'].forEach(s=>$(s).onclick=scanCusa);$('#saveSettings').onclick=saveSettings;$('#applyProfile').onclick=applyProfile;$('#performanceProfile').onchange=updateProfileHint;$('#gpuIndex').onchange=updateGpuHint;$('#refreshStatus').onclick=refresh;$('#probeVulkan').onclick=probeVulkan;$('#runDiagnostics').onclick=runDiagnostics;$('#diagQuick').onclick=()=>{showPage('system');runDiagnostics()};$('#openPipelineCache').onclick=openPipelineCache;$('#cacheQuick').onclick=openPipelineCache;$('#closeModal').onclick=()=>$('#gameModal').classList.remove('open');$('#gameModal').onclick=e=>{if(e.target.id==='gameModal')e.currentTarget.classList.remove('open')};$('#modalPlay').onclick=playSelected;$('#modalProfile').onchange=saveGameProfile;$('#modalBootMode').onchange=saveBootMode;$('#modalFavorite').onclick=favSelected;$('#modalRemove').onclick=removeSelected;$('#modalFolder').onclick=openSelectedFolder;$('#verifyBtn').onclick=verify;$('#verifyQuick').onclick=verify;$('#cleanCacheBtn').onclick=clean;$('#openGames').onclick=()=>post('/api/open-folder',{}).catch(e=>toast(e.message,true));$('#openPS5').onclick=()=>post('/api/open-engine',{engine:'kyty'}).catch(e=>toast(e.message,true));$('#openPS4').onclick=()=>post('/api/open-engine',{engine:'shadps4'}).catch(e=>toast(e.message,true));
+ document.addEventListener('keydown',e=>{if(e.key==='Escape')$('#gameModal').classList.remove('open')});
+ refresh();setInterval(async()=>{try{state.status=await api('/api/status');renderStatus()}catch{}},15000);
+--- a/webui/styles.css
++++ b/webui/styles.css
+@@ -8,3 +8,7 @@
+ @media(max-width:570px){.check-grid{grid-template-columns:1fr}}
+ 
+ .game-profile-line{display:flex;align-items:center;gap:12px;margin:14px 0;padding:10px 12px;border:1px solid rgba(139,92,246,.2);border-radius:12px;background:rgba(124,58,237,.06)}.game-profile-line span{font-size:12px;color:var(--muted);white-space:nowrap}.game-profile-line select{min-width:150px;margin-left:auto}
++
++/* PKG_DoW 2.2 — CUSA + Vulkan integration */
++.cusa-badge{position:absolute;left:8px;top:8px;z-index:4;padding:4px 7px;border-radius:8px;background:#0b1020d9;border:1px solid #8d66ff66;color:#cbb8ff;font-size:9px;font-weight:800;letter-spacing:.7px;box-shadow:0 5px 18px #0008}.profile-hint.compact{min-height:0;margin-top:-4px;padding:9px 10px}.vulkan-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:0 0 18px}.vulkan-card{border:1px solid #2c3b59;background:linear-gradient(145deg,#101a30,#0b1222);border-radius:16px;padding:15px}.vulkan-card.ok{border-color:#285b4a}.vulkan-card.warn{border-color:#685628}.vulkan-card.bad{border-color:#6d3143;grid-column:1/-1}.vk-head{display:flex;gap:10px;align-items:center}.vk-head b{font-size:14px}.gpu-index{display:inline-grid;place-items:center;min-width:48px;height:26px;border-radius:8px;background:#6938d833;color:#c7b0ff;border:1px solid #794fe066;font-size:10px;font-weight:800}.vk-spec{display:flex;gap:8px;flex-wrap:wrap;margin:11px 0;color:#9ca8bf;font-size:11px}.vk-spec span{padding:4px 7px;background:#10192a;border-radius:7px;border:1px solid #202e49}.vk-ext{display:flex;gap:7px;flex-wrap:wrap}.vk-ext i{font-style:normal;font-size:10px;padding:4px 7px;border-radius:10px;border:1px solid #3c4558;color:#8f9bb1}.vk-ext i.yes{border-color:#2d6d51;color:#75dca5;background:#10312155}.vk-ext i.no{border-color:#704052;color:#f298aa;background:#35111c55}.game-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:10px 0 2px}.game-details span{padding:8px 10px;background:#10182a;border:1px solid #27344f;border-radius:10px}.game-details small{display:block;color:#7f8ca5;font-size:9px;text-transform:uppercase;letter-spacing:.8px}.game-details b{display:block;margin-top:3px;color:#dce3f3;font-size:12px}.inline-actions .full{flex:1}.actions{flex-wrap:wrap}
++@media(max-width:850px){.vulkan-grid{grid-template-columns:1fr}}@media(max-width:570px){.game-details{grid-template-columns:1fr}}
+--- a/userdata/settings.json
++++ b/userdata/settings.json
+@@ -10,5 +10,6 @@
+   "gpu_index": -1,
+   "vblank_frequency": 60,
+   "redzone": true,
+-  "playgo_hack": false
++  "playgo_hack": false,
++  "ps4_boot_mode": "auto"
+ }
+--- a/src/graphics/presentation/window/vulkanWindow.cpp
++++ b/src/graphics/presentation/window/vulkanWindow.cpp
+@@ -39,11 +39,13 @@
+ #include "loader/systemContent.h"
+ 
+ #include <algorithm>
++#include <cinttypes>
+ #include <cstdio>
+ #include <cstring>
+ #include <fmt/format.h>
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
+ #include <vulkan/vk_platform.h>
+ 
+@@ -157,13 +159,22 @@
+ 	    });
+ 	EXIT_NOT_IMPLEMENTED(devices.empty());
+ 
+-	if (Config::GetGpuIndex() >= 0) {
+-		devices = {devices[Config::GetGpuIndex()]};
++	const auto configured_gpu = Config::GetGpuIndex();
++	if (configured_gpu >= 0) {
++		const auto gpu_index = static_cast<size_t>(configured_gpu);
++		if (gpu_index < devices.size()) {
++			LOGF("Vulkan: forcing configured GPU index %d\n", configured_gpu);
++			devices = {devices[gpu_index]};
++		} else {
++			LOGF("Vulkan: configured GPU index %d is out of range (adapters=%zu); falling back to automatic selection\n",
++			     configured_gpu, devices.size());
++		}
+ 	}
+ 
+-	vk::PhysicalDevice  best_device       = nullptr;
+-	uint32_t            best_queue_family = static_cast<uint32_t>(-1);
+-	SurfaceCapabilities best_capabilities;
++	vk::PhysicalDevice           best_device       = nullptr;
++	uint32_t                     best_queue_family = static_cast<uint32_t>(-1);
++	SurfaceCapabilities          best_capabilities;
++	std::pair<int32_t, uint64_t> best_score {-1, 0};
+ 
+ 	for (const auto& device: devices) {
+ 		bool skip_device = false;
+@@ -449,11 +460,31 @@
+ 			continue;
+ 		}
+ 
+-		if (best_device == nullptr ||
+-		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
++		vk::PhysicalDeviceMemoryProperties memory {};
++		device.getMemoryProperties(&memory);
++		uint64_t   device_local_bytes = 0;
++		for (uint32_t heap = 0; heap < memory.memoryHeapCount; ++heap) {
++			if ((memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) !=
++			    vk::MemoryHeapFlags {}) {
++				device_local_bytes += memory.memoryHeaps[heap].size;
++			}
++		}
++		int32_t type_rank = 0;
++		switch (device_properties.deviceType) {
++			case vk::PhysicalDeviceType::eDiscreteGpu: type_rank = 4; break;
++			case vk::PhysicalDeviceType::eIntegratedGpu: type_rank = 3; break;
++			case vk::PhysicalDeviceType::eVirtualGpu: type_rank = 2; break;
++			case vk::PhysicalDeviceType::eCpu: type_rank = 1; break;
++			default: break;
++		}
++		const std::pair<int32_t, uint64_t> candidate_score {type_rank, device_local_bytes};
++		LOGF("Vulkan candidate score: %s type=%d local_mem=%" PRIu64 " MiB\n",
++		     device_properties.deviceName.data(), type_rank, device_local_bytes / (1024 * 1024));
++		if (best_device == nullptr || candidate_score > best_score) {
+ 			best_device       = device;
+ 			best_queue_family = queue_family;
+ 			best_capabilities = std::move(candidate_capabilities);
++			best_score        = candidate_score;
+ 		}
+ 	}
+ 
+--- /dev/null
++++ b/docs/CUSA_VULKAN_2_2.md
+@@ -0,0 +1,76 @@
++# PKG_DoW 2.2 — integração CUSA + Vulkan
++
++## Escopo
++
++Esta fase não tenta transformar o core PS5 em um emulador PS4 por decreto administrativo. CUSA é tratado na camada de launcher e despachado para um `shadPS4` fornecido pelo usuário, enquanto o KytyPS5 continua responsável por PS5. O objetivo foi reduzir erros de roteamento, escolher melhor a GPU Vulkan e tornar o diagnóstico útil antes do boot.
++
++## CUSA
++
++O backend Python agora normaliza e indexa IDs `CUSAxxxxx`, lê campos de `param.sfo` e mantém por título:
++
++- `TITLE_ID` / CUSA;
++- `CONTENT_ID`;
++- `APP_VER` / `VERSION`;
++- `SYSTEM_VER` quando presente;
++- categoria e região inferida do prefixo do Content ID;
++- perfil de desempenho e modo de boot PS4 independentes por jogo.
++
++Foi adicionado um scanner de raiz CUSA. Ele procura pastas que contenham `sce_sys/param.sfo` ou `eboot.bin`, cadastra o título e evita descer em árvores de cache/dados depois que encontra uma raiz de jogo.
++
++A identidade de biblioteca de um título CUSA agora deriva do próprio serial (`ps4:CUSAxxxxx`) em vez do caminho absoluto. Assim, mover a pasta do jogo e fazer novo scan atualiza a entrada existente, em vez de criar um clone só porque o usuário organizou o disco.
++
++### Modos de boot PS4
++
++**Auto / eboot** é o padrão. Ele envia o `eboot.bin` diretamente ao shadPS4 e não depende da lista interna de pastas do shadPS4.
++
++**CUSA** envia o serial como argumento, por exemplo `CUSA00001`. Esse modo é útil quando o usuário já cadastrou a raiz de jogos no shadPS4. O README oficial do shadPS4 documenta esse formato de inicialização.
++
++O launcher também executa `shadPS4 --help` e descobre dinamicamente opções disponíveis. Flags como fullscreen, GPU e present mode só são adicionadas quando a versão instalada realmente as anuncia. Isso evita quebrar o boot quando a CLI muda entre releases.
++
++## Vulkan no launcher
++
++O backend Python ganhou um probe Vulkan nativo usando apenas `ctypes`:
++
++1. carrega `vulkan-1.dll`, `libvulkan.so` ou equivalente;
++2. consulta a versão do loader;
++3. cria uma instância mínima;
++4. enumera adaptadores físicos;
++5. coleta nome, tipo, API Vulkan, IDs PCI/vendor e memória device-local;
++6. enumera extensões do dispositivo;
++7. marca se o adaptador atende Vulkan 1.3 + `VK_KHR_swapchain` + `VK_KHR_push_descriptor` para o caminho PS4/shadPS4.
++
++A UX usa essa enumeração para preencher o seletor de GPU em vez de pedir que o usuário adivinhe um número. A humanidade já inventou menus suspensos; podemos ao menos aproveitar essa rara vitória.
++
++O fallback PowerShell preserva a mesma API da UX. Sem Python ele detecta o loader e, quando `vulkaninfo.exe` está disponível, também extrai adaptadores do resumo do utilitário.
++
++## Vulkan no core C++
++
++`src/graphics/presentation/window/vulkanWindow.cpp` recebeu duas correções de seleção de adaptador:
++
++- **índice configurado com bounds check**: um `--gpu` fora da faixa não indexa mais o vetor de dispositivos diretamente; registra o erro e volta para seleção automática;
++- **score de seleção automática**: depois de validar features, extensões, formatos, queue/present e surface capabilities, candidatos são comparados por classe de dispositivo (dedicada > integrada > virtual > CPU) e, dentro da mesma classe, memória device-local. Antes, uma GPU dedicada posterior simplesmente substituía outra dedicada anterior.
++
++Isto não promete FPS por si só, mas evita um caso bastante real de usar a GPU errada em máquinas híbridas ou multi-GPU.
++
++## Sincronização
++
++O core já exige Vulkan 1.3, `dynamicRendering`, `synchronization2` e timeline semaphores. Não converti o submit principal para `vkQueueSubmit2` nesta fase porque isso muda semântica de sincronização e precisa de captura/validação numa GPU real. Vulkan deixa sincronização e visibilidade de memória explicitamente sob responsabilidade da aplicação, então trocar primitivas sem medir é uma maneira muito sofisticada de criar flicker.
++
++## Fontes técnicas consultadas
++
++- shadPS4 README / uso por CUSA: https://github.com/shadps4-emu/shadPS4/
++- shadPS4 settings / Vulkan GPU e cache: https://github.com/shadps4-emu/shadPS4/blob/main/src/core/emulator_settings.h
++- shadPS4 quick start / requisitos Vulkan: https://github.com/shadps4-emu/shadPS4/wiki/I.-Quick-start-%5BUsers%5D
++- Vulkan synchronization: https://docs.vulkan.org/spec/latest/chapters/synchronization.html
++- Vulkan timeline semaphores: https://docs.vulkan.org/tutorial/latest/Advanced_Vulkan_Compute/08_Asynchronous_Compute/03_timeline_semaphores.html
++
++## Validação realizada
++
++- `python -m py_compile tools/pkg_dow_server.py`;
++- `python tools/test_pkg_dow_server.py`, incluindo fixture CUSA e descoberta de flags de CLI;
++- `node --check webui/app.js`;
++- verificação automática de IDs usados pelo JS contra o HTML;
++- servidor HTTP real com `/`, `/api/status` e `/api/vulkan`;
++- tentativa de configuração CMake registrada em `docs/build_2_2_configure.log`.
++
++O CMake parou ao tentar baixar `xbyak` porque este sandbox não possui resolução de rede para o subprocesso do Git. Portanto o patch C++ foi revisado e mantido no fonte, mas não foi compilado aqui. Essa limitação está registrada, em vez de ser magicamente convertida em “100% testado”.
+--- /dev/null
++++ b/docs/VALIDATION_2_2.md
+@@ -0,0 +1,24 @@
++# Validação PKG_DoW 2.2
++
++## Passou
++
++- Python backend compila com `py_compile`.
++- Testes de `PARAM.SFO` e PKG metadata passam.
++- Fixture CUSA (`CUSA01234`) é reconhecida como PS4, entra no scanner de raiz, preserva o serial e mantém o mesmo ID de biblioteca mesmo após mover a pasta.
++- Descoberta dinâmica de flags do shadPS4 via `--help` foi validada com executável fixture.
++- JavaScript passa em `node --check`.
++- Todos os IDs acessados por `$('#...')` no JavaScript existem no HTML.
++- Servidor local respondeu `200` para `/` e JSON válido em `/api/status` e `/api/vulkan`.
++- O PKG de teste `PS4_LAPY20014_v1.01.pkg` continua sendo identificado corretamente como PS4/LAPY20014 e permanece marcado como conteúdo que precisa ser instalado/extraído antes do boot.
++- O probe Vulkan reconheceu o loader 1.4.309 do sandbox; a criação da instância retornou `VK_ERROR_INCOMPATIBLE_DRIVER` porque este container não expõe uma GPU Vulkan utilizável. O erro é reportado pela UX em vez de ser mascarado.
++
++## Não foi possível validar neste sandbox
++
++- `1.bat` em Windows real.
++- fallback PowerShell executado, porque não há PowerShell instalado no ambiente Linux.
++- compilação do core após a mudança em `vulkanWindow.cpp`. A configuração CMake tentou baixar `xbyak` e falhou porque o subprocesso não possui acesso DNS/rede. Consulte `build_2_2_configure.log`.
++- FPS real, porque não existe GPU de apresentação no sandbox.
++
++## Resultado prático
++
++A integração CUSA/Vulkan do launcher foi exercitada de ponta a ponta onde o ambiente permite. O patch do core é pequeno e defensivo: bounds check do índice e seleção multi-GPU por classe/memória. Não há alegação de FPS medido sem uma GPU real, porque números inventados continuam sendo números inventados, mesmo com um gradiente roxo bonito na UX.

@@ -1,0 +1,292 @@
+--- a/src/graphics/guest_gpu/gpu_format.cpp
++++ b/src/graphics/guest_gpu/gpu_format.cpp
+@@ -232,4 +232,11 @@
+ 	return format == BufferFormat::k11_11_10UInt ? BufferFormat::k32UInt : format;
+ }
+ 
++bool TextureNeedsShaderSrgbDecode(BufferFormat format) {
++	// VK_FORMAT_R8_SRGB and VK_FORMAT_R8G8_SRGB are optional and are absent on common desktop
++	// drivers, so these are stored as UNORM and decoded in the shader. Four-channel sRGB maps
++	// to a real host sRGB format and is decoded by the sampler.
++	return format == BufferFormat::k8Srgb || format == BufferFormat::k8_8Srgb;
++}
++
+ } // namespace Libs::Graphics::Prospero
+--- a/src/graphics/guest_gpu/gpu_format.h
++++ b/src/graphics/guest_gpu/gpu_format.h
+@@ -45,6 +45,9 @@
+ bool                       IsSampledTextureFormat(BufferFormat format);
+ bool                       IsUintTextureFormat(BufferFormat format);
+ BufferFormat               RemapTextureFormat(BufferFormat format);
++// True for sRGB texture formats that have no dependable host equivalent, so the sRGB transfer
++// function has to be applied by the shader after sampling instead of by the sampler.
++bool                       TextureNeedsShaderSrgbDecode(BufferFormat format);
+ 
+ } // namespace Libs::Graphics::Prospero
+ 
+--- a/src/graphics/host_gpu/vulkanCommon.cpp
++++ b/src/graphics/host_gpu/vulkanCommon.cpp
+@@ -56,8 +56,9 @@
+     {Prospero::BufferFormat::k32_32_32_32UInt, vk::Format::eR32G32B32A32Uint},
+     {Prospero::BufferFormat::k32_32_32_32SInt, vk::Format::eR32G32B32A32Sint},
+     {Prospero::BufferFormat::k32_32_32_32Float, vk::Format::eR32G32B32A32Sfloat},
+-    // Narrow-channel sRGB formats are optional in Vulkan. Keep a same-width fallback until
+-    // sampler-aware sRGB emulation is available.
++    // VK_FORMAT_R8_SRGB and VK_FORMAT_R8G8_SRGB are optional and are missing on common desktop
++    // drivers, so these stay UNORM and the shader applies the transfer function after sampling.
++    // See Prospero::TextureNeedsShaderSrgbDecode.
+     {Prospero::BufferFormat::k8Srgb, vk::Format::eR8Unorm},
+     {Prospero::BufferFormat::k8_8Srgb, vk::Format::eR8G8Unorm},
+     {Prospero::BufferFormat::k8_8_8_8Srgb, vk::Format::eR8G8B8A8Srgb},
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterImage.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterImage.cpp
+@@ -372,6 +372,48 @@
+ 	return info;
+ }
+ 
++// Narrow-channel sRGB textures are stored as UNORM because the matching host formats are
++// optional and commonly missing, so the sampler cannot apply the transfer function. Undo the
++// gamma here instead; guest shaders sample these expecting linear values.
++uint32_t DecodeImageSrgb(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel,
++                         bool gather) {
++	auto& state = ctx.state;
++	if (!state.program.info.images[mem.resource].srgb_decode) return texel;
++
++	const auto f32       = TypeF32(state);
++	const auto boolean   = TypeBool(state);
++	const auto threshold = ConstantF32Value(state, 0.04045F);
++	const auto inv_slope = ConstantF32Value(state, 1.0F / 12.92F);
++	const auto offset    = ConstantF32Value(state, 0.055F);
++	const auto inv_scale = ConstantF32Value(state, 1.0F / 1.055F);
++	const auto gamma     = ConstantF32Value(state, 2.4F);
++
++	// A gather returns one channel from four texels, so every component is colour there. A plain
++	// sample returns rgba, and alpha is always linear.
++	const auto decoded_components = gather ? 4u : 3u;
++	uint32_t   components[4] {};
++	for (uint32_t component = 0; component < 4u; component++) {
++		const auto value = state.builder.AllocateId();
++		state.builder.AddFunction({OpCompositeExtract, f32, value, texel, component});
++		if (component >= decoded_components) {
++			components[component] = value;
++			continue;
++		}
++		const auto low = Binary(state, OpFMul, f32, value, inv_slope);
++		const auto biased =
++		    Binary(state, OpFMul, f32, Binary(state, OpFAdd, f32, value, offset), inv_scale);
++		const auto high = state.builder.AllocateId();
++		state.builder.AddFunction({OpExtInst, f32, high, GlslStd450(state), GlslPow, biased, gamma});
++		const auto use_low = Binary(state, OpFOrdLessThanEqual, boolean, value, threshold);
++		components[component] = state.builder.AllocateId();
++		state.builder.AddFunction({OpSelect, f32, components[component], use_low, low, high});
++	}
++	const auto result = state.builder.AllocateId();
++	state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 4), result, components[0],
++	                           components[1], components[2], components[3]});
++	return result;
++}
++
+ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
+ 	const auto info = ImageConversionFormat(ctx.state, mem);
+ 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
+@@ -664,8 +706,10 @@
+ 					return true;
+ 				}
+ 				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, pc, coord, integer);
+-				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample), integer,
+-				                              false, mem, true));
++				ctx.Define(inst,
++				           ResultVector(ctx, DecodeImageSrgb(ctx, mem, UnpackImageGather(ctx, mem, sample),
++				                                             true),
++				                        integer, false, mem, true));
+ 				return true;
+ 			}
+ 			if (view == ImageViewKind::Dim1DArray) {
+@@ -701,8 +745,10 @@
+ 				words.push_back(PackedOffset(ctx, mem, *address, layout, view));
+ 			}
+ 			state.builder.AddFunction(words);
+-			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
+-			                              integer && !dref, false, mem, true));
++			ctx.Define(inst,
++			           ResultVector(ctx, DecodeImageSrgb(ctx, mem, UnpackImageGather(ctx, mem, sample),
++			                                             true),
++			                        integer && !dref, false, mem, true));
+ 			return true;
+ 		}
+ 		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
+@@ -753,8 +799,12 @@
+ 		const auto& image = state.program.info.images[mem.resource];
+ 		if (image.indirect_root != mem.resource) {
+ 			const auto sample = EmitSample(mem.resource);
+-			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
+-			                              integer, dref, mem));
++			ctx.Define(inst,
++			           ResultVector(ctx,
++			                        dref ? sample
++			                             : DecodeImageSrgb(ctx, mem, UnpackImageTexel(ctx, mem, sample),
++			                                               false),
++			                        integer, dref, mem));
+ 			return true;
+ 		}
+ 		const auto* handle = image_arg.ResolveInstruction();
+@@ -846,7 +896,10 @@
+ 		EmitLabel(state, merge_label);
+ 		state.builder.AddFunction(phi_words);
+ 		ctx.Define(inst,
+-		           ResultVector(ctx, dref ? phi_words[2] : UnpackImageTexel(ctx, mem, phi_words[2]),
++		           ResultVector(ctx,
++		                        dref ? phi_words[2]
++		                             : DecodeImageSrgb(
++		                                   ctx, mem, UnpackImageTexel(ctx, mem, phi_words[2]), false),
+ 		                        integer, dref, mem));
+ 		return true;
+ 	}
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h
+@@ -283,6 +283,7 @@
+ 	GlslFract           = 10,
+ 	GlslSin             = 13,
+ 	GlslCos             = 14,
++	GlslPow             = 26,
+ 	GlslExp2            = 29,
+ 	GlslLog2            = 30,
+ 	GlslSqrt            = 31,
+--- a/src/graphics/shader/recompiler/ir/ShaderIR.h
++++ b/src/graphics/shader/recompiler/ir/ShaderIR.h
+@@ -146,6 +146,7 @@
+ 	uint32_t                mip_count                 = 1;
+ 	Prospero::BufferFormat  conversion_format         = Prospero::BufferFormat::kInvalid;
+ 	uint32_t                shader_swizzle            = ShaderImageIdentitySwizzle;
++	bool                    srgb_decode               = false;
+ 	bool                    read                      = false;
+ 	bool                    written                   = false;
+ 	bool                    atomic                    = false;
+--- a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+@@ -356,6 +356,7 @@
+ 				    program.info.images[root].mip_mode != image.mip_mode ||
+ 				    program.info.images[root].mip_count != image.mip_count ||
+ 				    program.info.images[root].conversion_format != image.conversion_format ||
++				    program.info.images[root].srgb_decode != image.srgb_decode ||
+ 				    program.info.images[root].shader_swizzle != image.shader_swizzle ||
+ 				    program.info.images[root].cube != image.cube) {
+ 					return false;
+@@ -392,6 +393,9 @@
+ 			if (image.conversion_format != conversion_format) {
+ 				return false;
+ 			}
++			if (image.srgb_decode != Prospero::TextureNeedsShaderSrgbDecode(format)) {
++				return false;
++			}
+ 			if ((storage || conversion_format != Prospero::BufferFormat::kInvalid) &&
+ 			    image.shader_swizzle != DescriptorImageSwizzle(descriptor)) {
+ 				return false;
+@@ -644,6 +648,7 @@
+ 		const bool storage      = image.kind == ResourceKind::StorageImage ||
+ 		                          image.kind == ResourceKind::StorageImageUint;
+ 		image.conversion_format = ImageConversionFormat(format);
++		image.srgb_decode        = Prospero::TextureNeedsShaderSrgbDecode(format);
+ 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
+ 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
+ 		}
+@@ -694,6 +699,7 @@
+ 				image.dimension         = image_class.dimension;
+ 				image.mip_count         = image_class.mip_count;
+ 				image.conversion_format = image_class.conversion_format;
++				image.srgb_decode        = image_class.srgb_decode;
+ 				image.shader_swizzle    = image_class.shader_swizzle;
+ 				image.cube              = image_class.cube;
+ 			}
+@@ -701,6 +707,7 @@
+ 			    image.mip_mode != image_class.mip_mode ||
+ 			    image.mip_count != image_class.mip_count ||
+ 			    image.conversion_format != image_class.conversion_format ||
++			    image.srgb_decode != image_class.srgb_decode ||
+ 			    image.shader_swizzle != image_class.shader_swizzle ||
+ 			    image.depth_compare != image_class.depth_compare ||
+ 			    image.cube != image_class.cube) {
+--- a/tests/ResourceTrackingTests.cpp
++++ b/tests/ResourceTrackingTests.cpp
+@@ -1116,6 +1116,73 @@
+         "buffer swizzle change did not invalidate specialization");
+ }
+ 
++void TestNarrowSrgbImageDecode() {
++  // VK_FORMAT_R8_SRGB and VK_FORMAT_R8G8_SRGB are optional and commonly missing, so narrow sRGB
++  // textures are stored as UNORM and the shader has to apply the transfer function itself.
++  const auto BuildSampler = [](Fixture &fixture) {
++    std::array<Value, 8> image_words;
++    for (uint32_t index = 0; index < image_words.size(); index++) {
++      image_words[index] = fixture.UserData(index);
++    }
++    const auto image_address = fixture.ImageAddress();
++    const auto image = fixture.Image(image_words, 4);
++    const auto sampler =
++        fixture.Sampler({Value(0u), Value(1u), Value(2u), Value(0u)}, 4);
++    MemoryInfo memory;
++    memory.kind = ResourceKind::Image;
++    memory.image_dimension = Decoder::ImageDimension::Dim2D;
++    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, image_address},
++                 fixture.AddMemory(memory, 4));
++    fixture.PlanAndTrack();
++  };
++  const auto Descriptor = [](Libs::Graphics::Prospero::BufferFormat format) {
++    DescriptorValue descriptor{};
++    descriptor.dwords[0] = 0x1000u;
++    descriptor.dwords[1] = static_cast<uint32_t>(format) << 20u;
++    descriptor.dwords[2] = 3u | (3u << 14u);
++    descriptor.dwords[3] =
++        Libs::Graphics::DstSel(4, 5, 6, 7) |
++        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
++         << 28u);
++    descriptor.dword_count = 8;
++    return descriptor;
++  };
++
++  Fixture narrow;
++  BuildSampler(narrow);
++  ResourceSnapshot narrow_snapshot;
++  narrow_snapshot.images.assign(
++      narrow.program.info.images.size(),
++      Descriptor(Libs::Graphics::Prospero::BufferFormat::k8_8Srgb));
++  std::string error;
++  Check(SpecializeResources(narrow.program, narrow_snapshot, &error) &&
++            narrow.program.info.images[0].srgb_decode &&
++            ValidateResourceSpecialization(narrow.program, narrow_snapshot, &error),
++        "narrow sRGB image was not specialized to decode in the shader");
++
++  // The decode is baked into the shader, so a descriptor that swaps to a format the sampler
++  // decodes itself has to invalidate the specialization instead of reusing this code.
++  ResourceSnapshot swapped;
++  swapped.images.assign(
++      narrow.program.info.images.size(),
++      Descriptor(Libs::Graphics::Prospero::BufferFormat::k8_8_8_8Srgb));
++  Check(!ValidateResourceSpecialization(narrow.program, swapped, &error),
++        "leaving a narrow sRGB format did not invalidate specialization");
++
++  // Four-channel sRGB maps to a real host sRGB format, so the sampler still applies the curve
++  // and the shader must not apply it a second time.
++  Fixture wide;
++  BuildSampler(wide);
++  ResourceSnapshot wide_snapshot;
++  wide_snapshot.images.assign(
++      wide.program.info.images.size(),
++      Descriptor(Libs::Graphics::Prospero::BufferFormat::k8_8_8_8Srgb));
++  Check(SpecializeResources(wide.program, wide_snapshot, &error) &&
++            !wide.program.info.images[0].srgb_decode &&
++            ValidateResourceSpecialization(wide.program, wide_snapshot, &error),
++        "sampler-decoded sRGB image was given a redundant shader decode");
++}
++
+ void TestShaderInfoAndBindingLayout() {
+   Fixture fixture;
+   const auto handle = fixture.Buffer(
+@@ -1345,6 +1412,7 @@
+     Run("DMA address materialization", TestDmaAddressMaterialization);
+     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
+     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
++    Run("narrow sRGB image decode", TestNarrowSrgbImageDecode);
+     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
+     Run("graphics push constants", TestGraphicsPushConstantLayout);
+     Run("resource limit", TestResourceLimitIsTransactional);

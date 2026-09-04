@@ -1,0 +1,55 @@
+# Build systems and IDEs
+_Build/
+build/
+build-*/
+cmake-build-*/
+.vs/
+.vscode/
+.idea/
+CMakeUserPresets.json
+
+# Runtime downloaded by Setup.cmd
+.runtime/
+runtime/
+engines/
+tools/pkgtool/
+
+# User-owned content and generated state
+userdata/*
+!userdata/.gitkeep
+logs/*
+!logs/.gitkeep
+_DownloadData/
+_TempData/
+_PipelineCache/
+_Textures/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Packages, games, firmware, keys, dumps
+*.pkg
+*.wad
+*.elf
+*.self
+*.sprx
+*.prx
+*.bin
+*.zip
+*.rar
+*.7z
+*.iso
+
+# Build outputs and OS noise
+*.log
+*.pdb
+*.ilk
+*.obj
+*.exe
+*.dll
+.DS_Store
+Thumbs.db
+desktop.ini

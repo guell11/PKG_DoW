@@ -1,0 +1,291 @@
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -197,22 +197,11 @@
+ 	};
+ 
+ 	struct GraphicsPipelineKeyHash {
+-		std::size_t operator()(const GraphicsPipelineKey& key) const {
+-			std::size_t hash = 0;
+-			PipelineKeyHash::MixRendering(hash, key.rendering);
+-			PipelineKeyHash::Mix(hash, key.vs_shader_id);
+-			PipelineKeyHash::Mix(hash, key.ps_shader_id);
+-			PipelineKeyHash::MixStaticParams(hash, key.static_params);
+-			return hash;
+-		}
++		std::size_t operator()(const GraphicsPipelineKey& key) const noexcept;
+ 	};
+ 
+ 	struct ComputePipelineKeyHash {
+-		std::size_t operator()(const ComputePipelineKey& key) const {
+-			std::size_t hash = 0;
+-			PipelineKeyHash::Mix(hash, key.cs_shader_id);
+-			return hash;
+-		}
++		std::size_t operator()(const ComputePipelineKey& key) const noexcept;
+ 	};
+ 
+ 	GraphicContext&                m_graphics;
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -34,14 +34,21 @@
+ namespace {
+ 
+ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+-	constexpr char hex[] = "0123456789abcdef";
+-	std::string    uuid(VK_UUID_SIZE * 2, '0');
++	// Vulkan pipeline-cache blobs are already validated by the driver UUID/device/driver tuple.
++	// Keep an emulator schema tag as well, but do not disable the cache for source-archive builds
++	// where git metadata is unavailable. Those are exactly the builds that benefit from a warm cache.
++	constexpr char        hex[]        = "0123456789abcdef";
++	constexpr std::string_view schema  = "KytyPC2";
++	const std::string_view revision = std::string_view(KYTY_GIT_REVISION) == "unknown"
++	                                      ? std::string_view("archive")
++	                                      : std::string_view(KYTY_GIT_REVISION);
++	std::string uuid(VK_UUID_SIZE * 2, '0');
+ 	for (size_t i = 0; i < VK_UUID_SIZE; i++) {
+ 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
+ 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
+ 	}
+-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
++	return fmt::format("{}:{}:{:08x}:{:08x}:{:08x}:{}\n", schema, revision, properties.vendorID,
++	                   properties.deviceID, properties.driverVersion, uuid);
+ }
+ 
+ std::string PipelineCacheTitleId() {
+@@ -82,6 +89,36 @@
+ 	static_params.scissor_ltrb[1] = 0;
+ 	static_params.scissor_ltrb[2] = 1;
+ 	static_params.scissor_ltrb[3] = 1;
++
++	// Blend constants are core Vulkan dynamic state. Keeping them in the pipeline key created
++	// needless variants whenever a game animated a constant blend factor.
++	static_params.blend_color_red   = 0.0f;
++	static_params.blend_color_green = 0.0f;
++	static_params.blend_color_blue  = 0.0f;
++	static_params.blend_color_alpha = 0.0f;
++
++	// Canonicalize blend registers that Vulkan ignores. Besides reducing pipeline variants, this
++	// prevents irrelevant/unknown guest blend factors from reaching GetBlendFactor when blending
++	// is disabled. Recent PS4 emulators use the same principle when refreshing graphics keys.
++	for (uint32_t i = 0; i < static_params.color_count; i++) {
++		const bool effective_blend = static_params.blend_enable[i] && !static_params.blend_bypass[i];
++		if (!effective_blend) {
++			static_params.blend_enable[i]         = false;
++			static_params.blend_bypass[i]         = false;
++			static_params.color_srcblend[i]       = 0;
++			static_params.color_comb_fcn[i]       = 0;
++			static_params.color_destblend[i]      = 0;
++			static_params.alpha_srcblend[i]       = 0;
++			static_params.alpha_comb_fcn[i]       = 0;
++			static_params.alpha_destblend[i]      = 0;
++			static_params.separate_alpha_blend[i] = false;
++		} else if (!static_params.separate_alpha_blend[i]) {
++			// Alpha state aliases color state when separate-alpha blending is disabled.
++			static_params.alpha_srcblend[i]  = 0;
++			static_params.alpha_comb_fcn[i]  = 0;
++			static_params.alpha_destblend[i] = 0;
++		}
++	}
+ }
+ 
+ } // namespace
+@@ -95,9 +132,16 @@
+ 	};
+ 
+ 	struct Permutation {
+-		std::vector<uint32_t>                               static_key;
++		std::vector<uint32_t>                                static_key;
+ 		std::shared_ptr<const ShaderRecompiler::IR::Program> program;
+-		ShaderProgram                                       handle;
++		ShaderProgram                                        handle;
++	};
++
++	struct SourceCache {
++		// One guest shader can have many resource/static specializations. Bucket them by a fast
++		// hash first, then retain exact-key + MaterializeProgram checks for collision safety.
++		std::unordered_map<uint64_t, std::vector<Permutation>> permutations;
++		uint64_t total_permutations = 0;
+ 	};
+ 
+ 	struct SourceKeyHash {
+@@ -132,40 +176,58 @@
+ 		}();
+ 
+ 		BuildStageStaticKey(input_info, key_scratch);
+-		auto& permutations = programs[{stage, params.hash}];
+-		for (const auto& permutation: permutations) {
+-			if (permutation.static_key == key_scratch &&
+-			    MaterializeProgram(permutation.program, params, input_info)) {
+-				return permutation.handle;
++		const uint64_t static_hash = key_scratch.empty()
++		                                 ? 0
++		                                 : XXH3_64bits(key_scratch.data(),
++		                                               key_scratch.size() * sizeof(uint32_t));
++		auto& source = programs[{stage, params.hash}];
++		if (auto bucket = source.permutations.find(static_hash);
++		    bucket != source.permutations.end()) {
++			for (const auto& permutation: bucket->second) {
++				if (permutation.static_key == key_scratch &&
++				    MaterializeProgram(permutation.program, params, input_info)) {
++					++num_cache_hits;
++					return permutation.handle;
++				}
+ 			}
+ 		}
+ 
++		++num_cache_misses;
+ 		const auto module = CompileProgram(device, params, input_info);
+ 		EXIT_IF(module == nullptr || !input_info.stage);
+-		uint64_t id = MixId(MixId(params.hash, static_cast<uint64_t>(stage)), permutations.size());
++		uint64_t id =
++		    MixId(MixId(params.hash, static_cast<uint64_t>(stage)), source.total_permutations++);
+ 		if (id == 0) {
+ 			id = 1;
+ 		}
+ 		const ShaderProgram handle {.id = id, .module = module};
+-		permutations.push_back({key_scratch, input_info.stage.program, handle});
++		source.permutations[static_hash].push_back({key_scratch, input_info.stage.program, handle});
+ 
+-		std::printf("Num compiled %u shaders\n", ++num_compiled);
++		std::printf("Num compiled %u shaders (cache hits=%" PRIu64 ", misses=%" PRIu64 ")\n",
++		            ++num_compiled, num_cache_hits, num_cache_misses);
+ 		return handle;
+ 	}
+ 
+ 	explicit ProgramCache(vk::Device device): device(device) {
+ 		key_scratch.reserve(MaxStaticKeyWords);
++		programs.reserve(2048);
+ 	}
+ 
+-	std::unordered_map<SourceKey, std::vector<Permutation>, SourceKeyHash> programs;
++	std::unordered_map<SourceKey, SourceCache, SourceKeyHash> programs;
+ 	std::vector<uint32_t> key_scratch;
+ 	vk::Device device;
+-	uint32_t   num_compiled = 0;
++	uint32_t   num_compiled   = 0;
++	uint64_t   num_cache_hits = 0;
++	uint64_t   num_cache_misses = 0;
+ };
+ 
+ PipelineCache::PipelineCache(GraphicContext& graphics)
+     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+ 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
++	// Avoid rehash/allocation churn in draw-heavy titles. These are only bucket reservations;
++	// pipeline objects are still created lazily on demand.
++	m_graphics_pipelines.reserve(2048);
++	m_compute_pipelines.reserve(512);
+ 	InitializeDriverCache();
+ }
+ 
+@@ -181,10 +243,13 @@
+ 	};
+ 	destroy(m_graphics_pipelines);
+ 	destroy(m_compute_pipelines);
+-	for (const auto& [key, permutations]: m_program_cache->programs) {
++	for (const auto& [key, source]: m_program_cache->programs) {
+ 		(void)key;
+-		for (const auto& permutation: permutations) {
+-			m_graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
++		for (const auto& [static_hash, permutations]: source.permutations) {
++			(void)static_hash;
++			for (const auto& permutation: permutations) {
++				m_graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
++			}
+ 		}
+ 	}
+ 	if (m_driver_cache != nullptr) {
+@@ -197,21 +262,6 @@
+ 	if (title_id.empty()) {
+ 		return;
+ 	}
+-	if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+-		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
+-		return;
+-	}
+-	const std::string_view git_hash     = KYTY_GIT_HASH;
+-	const std::string_view git_revision = KYTY_GIT_REVISION;
+-	if (git_hash == "unknown" || git_revision == "unknown") {
+-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
+-		return;
+-	}
+-	if (git_hash.ends_with("-dirty")) {
+-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
+-		return;
+-	}
+-
+ 	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+ 	const auto path         = Common::PathToString(m_driver_cache_path);
+ 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
+@@ -285,6 +335,11 @@
+ 		return;
+ 	}
+ 
++	PipelineCacheLog(
++	    "Pipeline cache stats: shaders compiled={}, shader hits={}, shader misses={}, gfx pipelines={}, compute pipelines={}",
++	    m_program_cache->num_compiled, m_program_cache->num_cache_hits,
++	    m_program_cache->num_cache_misses, m_graphics_pipelines.size(), m_compute_pipelines.size());
++
+ 	size_t               size = 0;
+ 	vk::Result           result;
+ 	std::vector<uint8_t> payload;
+@@ -380,6 +435,35 @@
+ 	return m_program_cache->Get(params, input_info);
+ }
+ 
++std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(
++    const GraphicsPipelineKey& key) const noexcept {
++	std::size_t hash = 0;
++	PipelineKeyHash::Mix(hash, key.rendering.color_count);
++	for (uint32_t i = 0; i < key.rendering.color_count; i++) {
++		PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.rendering.color_formats[i]));
++	}
++	PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.rendering.depth_format));
++	PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.rendering.stencil_format));
++	PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.vs_shader_id));
++	PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.ps_shader_id));
++	const uint64_t static_hash = XXH3_64bits(&key.static_params, sizeof(key.static_params));
++	PipelineKeyHash::Mix(hash, static_cast<std::size_t>(static_hash));
++	if constexpr (sizeof(std::size_t) < sizeof(uint64_t)) {
++		PipelineKeyHash::Mix(hash, static_cast<std::size_t>(static_hash >> 32u));
++	}
++	return hash;
++}
++
++std::size_t PipelineCache::ComputePipelineKeyHash::operator()(
++    const ComputePipelineKey& key) const noexcept {
++	std::size_t hash = 0;
++	PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.cs_shader_id));
++	if constexpr (sizeof(std::size_t) < sizeof(uint64_t)) {
++		PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.cs_shader_id >> 32u));
++	}
++	return hash;
++}
++
+ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
+ 	return std::memcmp(this, &other, sizeof(*this)) == 0;
+ }
+--- a/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
+@@ -877,6 +877,7 @@
+ 	    vk::DynamicState::eStencilCompareMask,
+ 	    vk::DynamicState::eStencilReference,
+ 	    vk::DynamicState::eStencilWriteMask,
++	    vk::DynamicState::eBlendConstants,
+ #if !defined(__APPLE__)
+ 	    // Keep last so depth-only pipelines can omit this dynamic state.
+ 	    vk::DynamicState::eColorWriteEnableEXT, // unsupported by MoltenVK; static mask instead
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -383,6 +383,11 @@
+ 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+ 	}
+ 
++	const auto& blend_color = ctx.GetBlendColor();
++	const float blend_constants[4] = {blend_color.red, blend_color.green, blend_color.blue,
++	                                  blend_color.alpha};
++	vk_buffer.setBlendConstants(blend_constants);
++
+ 	if (depth.stencil_test_enable) {
+ 		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
+ 		                                depth.stencil_dynamic_front.compareMask);

@@ -1,0 +1,29 @@
+Arquivos diferentes ou adicionados em relação ao ZIP original:
+Only in PKG_DoW_KytyPS5: 1.bat
+Only in PKG_DoW_KytyPS5: LEIA-ME_PKG_DoW.md
+Only in PKG_DoW_KytyPS5: PKG_DoW.bat
+Only in PKG_DoW_KytyPS5: VERSION.txt
+Only in PKG_DoW_KytyPS5/docs: MODIFIED_FILES.txt
+Only in PKG_DoW_KytyPS5/docs: ORCHESTRATOR_ANALYSIS.md
+Only in PKG_DoW_KytyPS5/docs: PERFORMANCE_ARCHITECTURE_V2.md
+Only in PKG_DoW_KytyPS5/docs: PKG_TEST_REPORT.md
+Only in PKG_DoW_KytyPS5/docs: VALIDATION_SUMMARY.md
+Only in PKG_DoW_KytyPS5/docs: build_probe.log
+Only in PKG_DoW_KytyPS5/docs: performance_v2.patch
+Only in PKG_DoW_KytyPS5/docs: repo_audit.json
+Only in PKG_DoW_KytyPS5/docs: shader_narrow_srgb_fix.patch
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/guest_gpu/gpu_format.cpp and PKG_DoW_KytyPS5/src/graphics/guest_gpu/gpu_format.cpp differ
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/guest_gpu/gpu_format.h and PKG_DoW_KytyPS5/src/graphics/guest_gpu/gpu_format.h differ
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp and PKG_DoW_KytyPS5/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp differ
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h and PKG_DoW_KytyPS5/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h differ
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/host_gpu/renderer/pipeline/shaders.cpp and PKG_DoW_KytyPS5/src/graphics/host_gpu/renderer/pipeline/shaders.cpp differ
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/host_gpu/renderer/renderDraw.cpp and PKG_DoW_KytyPS5/src/graphics/host_gpu/renderer/renderDraw.cpp differ
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/host_gpu/vulkanCommon.cpp and PKG_DoW_KytyPS5/src/graphics/host_gpu/vulkanCommon.cpp differ
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/shader/recompiler/backend/spirv/spirvEmitterImage.cpp and PKG_DoW_KytyPS5/src/graphics/shader/recompiler/backend/spirv/spirvEmitterImage.cpp differ
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h and PKG_DoW_KytyPS5/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h differ
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/shader/recompiler/ir/ShaderIR.h and PKG_DoW_KytyPS5/src/graphics/shader/recompiler/ir/ShaderIR.h differ
+Files /mnt/data/kyty_orig/KytyPS5-main/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp and PKG_DoW_KytyPS5/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp differ
+Files /mnt/data/kyty_orig/KytyPS5-main/tests/ResourceTrackingTests.cpp and PKG_DoW_KytyPS5/tests/ResourceTrackingTests.cpp differ
+Only in PKG_DoW_KytyPS5: tools
+Only in PKG_DoW_KytyPS5: userdata
+Only in PKG_DoW_KytyPS5: webui

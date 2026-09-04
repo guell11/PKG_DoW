@@ -1,0 +1,830 @@
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+
+#include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/profiler.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/vulkanCommon.h"
+#include "kernel/memory.h"
+
+#include <algorithm>
+#include <array>
+#include <cinttypes>
+#include <cstring>
+#include <memory>
+#include <utility>
+#include <vector>
+
+namespace Libs::Graphics {
+
+namespace {
+
+constexpr uint64_t MiB           = 1024 * 1024;
+constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+// Scheduler for the submission currently being recorded: compute submissions
+// record through the async-compute scheduler; everything else goes through
+// the graphics scheduler this cache was built with.
+CommandScheduler& RecordingScheduler(CommandScheduler& fallback) {
+	return CommandScheduler::HasRecording() ? CommandScheduler::Recording() : fallback;
+}
+
+} // namespace
+
+void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
+                                  uint64_t size) {
+	auto* bytes = static_cast<const uint8_t*>(source);
+	while (size != 0) {
+		const auto chunk = std::min(size, m_staging_buffer.Size());
+		// Do not stall the render thread when the upload ring is still owned by the GPU. Spill to
+		// a transient upload allocation and retire it at the submission tick instead.
+		auto [mapped, offset] = m_staging_buffer.Map(chunk, 4, false);
+		auto& recording = RecordingScheduler(m_scheduler);
+		if (mapped != nullptr) {
+			std::memcpy(mapped, bytes, static_cast<size_t>(chunk));
+			m_staging_buffer.Commit();
+			buffer.CopyFrom(recording.Current(), m_staging_buffer, offset,
+			                buffer.Offset(address), chunk, vk::AccessFlagBits::eHostWrite);
+		} else {
+			auto temporary = std::make_unique<Buffer>(
+			    m_graphics, recording, MemoryUsage::Upload, 0,
+			    vk::BufferUsageFlagBits::eTransferSrc, chunk);
+			temporary->Write(0, bytes, chunk);
+			buffer.CopyFrom(recording.Current(), *temporary, 0, buffer.Offset(address), chunk,
+			                vk::AccessFlagBits::eHostWrite);
+			recording.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+		}
+		bytes += chunk;
+		address += chunk;
+		size -= chunk;
+	}
+}
+
+struct BufferCache::DownloadCopy {
+	Buffer*  buffer        = nullptr;
+	uint64_t source_offset = 0;
+	uint64_t address       = 0;
+	uint64_t size          = 0;
+};
+
+void BufferCache::Register(BufferId id) {
+	ChangeRegister<true>(id);
+}
+
+void BufferCache::Unregister(BufferId id) {
+	ChangeRegister<false>(id);
+}
+
+template <bool insert>
+void BufferCache::ChangeRegister(BufferId id) {
+	auto& buffer = m_slot_buffers[id];
+	PageTable::PageRange pages {};
+	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		if constexpr (insert) {
+			m_page_table[page] = id;
+		} else {
+			m_page_table[page] = {};
+		}
+	}
+	const auto size_pages = pages.last_exclusive - pages.first;
+	if constexpr (insert) {
+		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
+		(void)it;
+		EXIT_IF(!inserted);
+		m_total_used_memory += buffer.Size();
+		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		std::vector<vk::DeviceAddress> addresses;
+		addresses.reserve(size_pages);
+		for (uint64_t i = 0; i < size_pages; ++i) {
+			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
+		}
+		WriteDataBuffer(m_bda_pagetable_buffer, pages.first * sizeof(vk::DeviceAddress),
+		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+	} else {
+		const auto found = m_buffers.find(buffer.CpuAddress());
+		EXIT_IF(found == m_buffers.end() || found->second != id);
+		m_buffers.erase(found);
+		EXIT_IF(buffer.Size() > m_total_used_memory);
+		m_total_used_memory -= buffer.Size();
+		m_lru_cache.Free(buffer.lru_id);
+		m_bda_pagetable_buffer.Fill(pages.first * sizeof(vk::DeviceAddress),
+		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		buffer.is_deleted = true;
+	}
+}
+
+void BufferCache::TouchBuffer(const Buffer& buffer) {
+	if (!buffer.is_deleted) {
+		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+	}
+}
+
+void BufferCache::DeleteBuffer(BufferId id) {
+	auto* buffer = m_slot_buffers.try_get(id);
+	if (buffer == nullptr || buffer->is_deleted) {
+		return;
+	}
+	Unregister(id);
+	if (m_scheduler.Active()) {
+		RecordingScheduler(m_scheduler).DeferOperation([this, id] { m_slot_buffers.erase(id); });
+	} else {
+		m_slot_buffers.erase(id);
+	}
+}
+
+std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& copy) {
+	if (copy.buffer == nullptr || copy.size == 0 || copy.source_offset > copy.buffer->Size() ||
+	    copy.size > copy.buffer->Size() - copy.source_offset) {
+		EXIT("BufferCache: invalid download copy\n");
+	}
+	const auto begin = copy.source_offset & ~uint64_t {3};
+	if (copy.source_offset > UINT64_MAX - copy.size ||
+	    copy.source_offset + copy.size > UINT64_MAX - 3) {
+		EXIT("BufferCache: download copy alignment overflow\n");
+	}
+	const auto end = (copy.source_offset + copy.size + 3) & ~uint64_t {3};
+	if (end > copy.buffer->Size()) {
+		EXIT("BufferCache: aligned download copy exceeds its owner\n");
+	}
+	return {begin, end - begin};
+}
+
+void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
+	std::vector<DownloadCopy> batch;
+	batch.reserve(copies.size());
+	uint64_t                  packed_size = 0;
+	auto&                     download    = m_download_buffer;
+	const auto flush = [&] {
+		const auto [mapped, base_offset] = download.Map(packed_size, DOWNLOAD_ALIGNMENT);
+		EXIT_IF(mapped == nullptr);
+		uint64_t cursor = 0;
+		for (const auto& copy: batch) {
+			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+			download.CopyFrom(RecordingScheduler(m_scheduler).Current(), *copy.buffer, source_begin, base_offset + cursor,
+			                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+			                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+			                  vk::AccessFlagBits::eHostRead);
+			cursor += AlignDownload(envelope_size);
+		}
+		download.Commit();
+		const auto completion_tick = m_scheduler.CurrentTick();
+		m_scheduler.Finish();
+		m_scheduler.WaitPriorityOperations(completion_tick);
+		cursor = 0;
+		for (const auto& copy: batch) {
+			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+			const auto offset = cursor + copy.source_offset - source_begin;
+			download.Invalidate(base_offset + offset, copy.size);
+			Libs::LibKernel::Memory::WriteBacking(copy.address, mapped + offset, copy.size);
+			cursor += AlignDownload(envelope_size);
+		}
+		batch.clear();
+		packed_size = 0;
+	};
+	for (auto copy: copies) {
+		while (copy.size != 0) {
+			const auto available = download.Size() - packed_size;
+			const auto prefix    = copy.source_offset & 3u;
+			const auto bytes     = std::min(copy.size, available - prefix);
+			DownloadCopy part {copy.buffer, copy.source_offset, copy.address, bytes};
+			const auto [source_begin, envelope_size] = DownloadEnvelope(part);
+			(void)source_begin;
+			packed_size += AlignDownload(envelope_size);
+			batch.push_back(part);
+			copy.source_offset += bytes;
+			copy.address += bytes;
+			copy.size -= bytes;
+			if (packed_size == download.Size()) {
+				flush();
+			}
+		}
+	}
+	if (!batch.empty()) {
+		flush();
+	}
+	for (const auto& copy: copies) {
+		m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+	}
+}
+
+BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
+                         PageManager& page_manager, TextureCache& texture_cache)
+	: m_graphics(graphics), m_scheduler(scheduler),
+	  m_fault_manager(graphics, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES),
+	  m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
+	  m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+	                         BDA_PAGETABLE_SIZE),
+	  m_memory_tracker(page_manager),
+	  m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+	  m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
+	  m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
+	  m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
+	  m_texture_cache(texture_cache) {
+	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
+	m_gds_buffer.Flush(0, m_gds_buffer.Size());
+	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
+	                     "BDA Page Table Buffer");
+	const auto null_id =
+	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
+	EXIT_IF(null_id != NULL_BUFFER_ID);
+	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	if (m_graphics.CanReportMemoryUsage()) {
+		const auto budget       = m_graphics.GetAdaptiveDeviceMemoryBudget();
+		m_trigger_gc_memory    = budget.target;
+		m_critical_gc_memory   = budget.critical;
+	}
+}
+
+BufferCache::~BufferCache() {
+	if (!m_gpu_modified_ranges.Empty()) {
+		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
+	}
+	for (const auto& [vaddr, id]: m_buffers) {
+		(void)vaddr;
+		const auto& buffer = m_slot_buffers[id];
+		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
+			EXIT("BufferCache: destroyed with GPU-modified buffer\n");
+		}
+	}
+	m_buffers.clear();
+}
+
+void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid memory-invalidation range\n");
+	}
+	m_memory_tracker.InvalidateRegion(vaddr, size,
+	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+}
+
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	m_scheduler.Context().GetGpu().SendCommandSync(
+	    [this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
+}
+
+void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+	// CPU invalidation reaches this point only for a GPU-owned tracker page. Resolve the exact
+	// Buffer owner on the GPU thread so the cache index remains single-thread-owned.
+	if (is_write && !IsRegionRegistered(vaddr, size)) {
+		return;
+	}
+	std::vector<DownloadCopy> copies;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size,
+	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		                                           "memory invalidation");
+	    },
+		[&](uint64_t address, uint64_t bytes) noexcept {
+		    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
+			    for (uint64_t copied = 0; copied < range.size;) {
+				    const auto copy_address = range.address + copied;
+				    const auto* owner = m_page_table.Find(copy_address >> PageTable::kPageBits);
+				    if (owner == nullptr || !*owner) {
+					    EXIT("BufferCache: invalidation readback has no buffer owner\n");
+				    }
+				    auto& buffer = m_slot_buffers[*owner];
+				    if (!buffer.IsInBounds(copy_address, 1)) {
+					    EXIT("BufferCache: invalidation readback is outside its buffer owner\n");
+				    }
+				    const auto copy_size = std::min(
+				        range.size - copied, buffer.CpuAddress() + buffer.Size() - copy_address);
+				    copies.push_back(
+				        {&buffer, buffer.Offset(copy_address), copy_address, copy_size});
+				    copied += copy_size;
+			    }
+		    }
+	    });
+	if (copies.empty()) {
+		if (!is_write) {
+			return;
+		}
+		// A preceding read fault can consume the last GPU-owned copy after this write invalidation
+		// has already chosen to flush. Complete the CPU ownership handoff even though this callback
+		// no longer has bytes to download.
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		return;
+	}
+	DownloadBufferMemory(copies);
+	// The enumeration above covered whole dirty pages and every exact interval on them.
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
+}
+
+BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0) {
+		return NULL_BUFFER_ID;
+	}
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid buffer discovery request\n");
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner != nullptr && *owner) {
+		auto& buffer = m_slot_buffers[*owner];
+		if (buffer.IsInBounds(vaddr, size)) {
+			return *owner;
+		}
+	}
+	return CreateBuffer(vaddr, size);
+}
+
+BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	auto& command = RecordingScheduler(m_scheduler).Current();
+	EXIT_IF(command.IsInvalid());
+	auto       begin = vaddr & ~(CACHING_PAGESIZE - 1);
+	auto       end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+	auto       first = m_buffers.lower_bound(begin);
+	if (first != m_buffers.begin()) {
+		const auto previous = std::prev(first);
+		if (const auto& buffer = m_slot_buffers[previous->second];
+		    buffer.CpuAddress() + buffer.Size() > begin) {
+			first = previous;
+		}
+	}
+	auto last = first;
+	for (; last != m_buffers.end() && last->first < end; ++last) {
+		const auto& buffer = m_slot_buffers[last->second];
+		begin              = std::min(begin, buffer.CpuAddress());
+		end                = std::max(end, buffer.CpuAddress() + buffer.Size());
+	}
+
+	const auto id = m_slot_buffers.insert(
+	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
+	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, end - begin);
+	auto&      buffer = m_slot_buffers[id];
+	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
+	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin, end - begin);
+	for (auto overlap = first; overlap != last;) {
+		const auto current = overlap++;
+		const auto old_id  = current->second;
+		const auto& old    = m_slot_buffers[old_id];
+		buffer.CopyFrom(command, old, 0, old.CpuAddress() - begin, old.Size());
+		DeleteBuffer(old_id);
+	}
+	Register(id);
+	return id;
+}
+
+bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
+                                    bool is_texel_buffer) {
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	vk::Buffer                  source;
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, is_written,
+	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+		    total_size += bytes;
+	    },
+	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	if (source) {
+		auto& command = RecordingScheduler(m_scheduler).Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		// Synchronization2 lets us scope the upload dependency to the stages this renderer actually
+		// uses instead of forcing an ALL_COMMANDS -> TRANSFER -> ALL_COMMANDS serialisation point.
+		constexpr auto consumer_stages = vk::PipelineStageFlagBits2::eAllGraphics |
+		                                 vk::PipelineStageFlagBits2::eComputeShader |
+		                                 vk::PipelineStageFlagBits2::eTransfer;
+		vk::BufferMemoryBarrier2 before {};
+		before.sType               = vk::StructureType::eBufferMemoryBarrier2;
+		before.srcStageMask        = consumer_stages;
+		before.srcAccessMask       = vk::AccessFlagBits2::eMemoryRead |
+		                             vk::AccessFlagBits2::eMemoryWrite;
+		before.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		before.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer              = buffer.Handle();
+		before.offset              = 0;
+		before.size                = buffer.Size();
+		vk::DependencyInfo before_dependency {};
+		before_dependency.sType                    = vk::StructureType::eDependencyInfo;
+		before_dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+		before_dependency.bufferMemoryBarrierCount = 1;
+		before_dependency.pBufferMemoryBarriers    = &before;
+		native.pipelineBarrier2(before_dependency);
+
+		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                  copies.data());
+
+		auto after          = before;
+		after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		after.dstStageMask  = consumer_stages;
+		after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		vk::DependencyInfo after_dependency {};
+		after_dependency.sType                    = vk::StructureType::eDependencyInfo;
+		after_dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+		after_dependency.bufferMemoryBarrierCount = 1;
+		after_dependency.pBufferMemoryBarriers    = &after;
+		native.pipelineBarrier2(after_dependency);
+	}
+	if (is_texel_buffer && !is_written) {
+		return SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
+	return false;
+}
+
+vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+                                     uint64_t total_size) {
+	if (copies.empty()) {
+		return nullptr;
+	}
+
+	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4, false);
+	if (mapped != nullptr) {
+		for (auto& copy: copies) {
+			const auto address = buffer.CpuAddress() + copy.dstOffset;
+			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			copy.srcOffset += base_offset;
+		}
+		m_staging_buffer.Commit();
+		return m_staging_buffer.Handle();
+	}
+
+	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+	for (const auto& copy: copies) {
+		const auto address = buffer.CpuAddress() + copy.dstOffset;
+		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
+		            reinterpret_cast<const void*>(address), copy.size);
+	}
+	temporary->Flush(0, total_size);
+	const auto handle = temporary->Handle();
+	RecordingScheduler(m_scheduler).DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return handle;
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
+                                                       bool is_written, bool is_texel_buffer,
+                                                       BufferId id) {
+	auto& command = RecordingScheduler(m_scheduler).Current();
+	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: buffer request requires a recording command buffer\n");
+	}
+
+	if (!is_written && size <= CACHING_PAGESIZE &&
+	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		const auto alignment = std::max<uint64_t>(
+		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
+			m_stream_buffer.Commit();
+			return {&m_stream_buffer, offset};
+		}
+	}
+
+	auto* buffer = m_slot_buffers.try_get(id);
+	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
+		id     = FindBuffer(vaddr, size);
+		buffer = &m_slot_buffers[id];
+	}
+	TouchBuffer(*buffer);
+	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
+	if (is_written) {
+		m_gpu_modified_ranges.Add(vaddr, size);
+	}
+	return {buffer, buffer->Offset(vaddr)};
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid image source\n");
+	}
+	auto find_owner = [&]() -> Buffer* {
+		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
+			return nullptr;
+		}
+		auto& buffer = m_slot_buffers[*owner];
+		return buffer.IsInBounds(vaddr, size) ? &buffer : nullptr;
+	};
+
+	{
+		const bool cpu_modified            = m_memory_tracker.IsRegionCpuModified(vaddr, size);
+		const bool gpu_modified            = m_memory_tracker.IsRegionGpuModified(vaddr, size);
+		const bool has_dirty_buffer_source = m_gpu_modified_ranges.Intersects(vaddr, size);
+		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, vaddr, size,
+		                                           "image source");
+
+		auto* owner = find_owner();
+		if (has_dirty_buffer_source && owner == nullptr) {
+			if (!IsRegionRegistered(vaddr, size)) {
+				EXIT("BufferCache: GPU-dirty image source has no native buffer\n");
+			}
+			owner = &m_slot_buffers[FindBuffer(vaddr, size)];
+		}
+		if (owner != nullptr && !cpu_modified && (!gpu_modified || has_dirty_buffer_source)) {
+			TouchBuffer(*owner);
+			return {owner, owner->Offset(vaddr)};
+		}
+		if (has_dirty_buffer_source && owner == nullptr) {
+			EXIT("BufferCache: GPU-dirty image source could not resolve its native owner\n");
+		}
+	}
+
+	Buffer* upload_buffer = &m_staging_buffer;
+	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16, false);
+	std::unique_ptr<Buffer> temporary_upload;
+	if (staging == nullptr) {
+		temporary_upload = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+		    vk::BufferUsageFlagBits::eTransferSrc, size);
+		upload_buffer = temporary_upload.get();
+		staging       = temporary_upload->Mapped().data();
+		stage_offset  = 0;
+	}
+	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
+		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	}
+	if (temporary_upload) {
+		temporary_upload->Flush(0, size);
+	} else {
+		m_staging_buffer.Commit();
+	}
+
+	const bool has_dirty_buffer_source = m_gpu_modified_ranges.Intersects(vaddr, size);
+	auto*      owner                   = find_owner();
+	if (has_dirty_buffer_source && owner == nullptr) {
+		EXIT("BufferCache: GPU-dirty image source lost its native owner\n");
+	}
+	if (owner == nullptr ||
+	    (m_memory_tracker.IsRegionGpuModified(vaddr, size) && !has_dirty_buffer_source)) {
+		if (temporary_upload) {
+			auto* result = upload_buffer;
+			RecordingScheduler(m_scheduler).DeferOperation(
+			    [owner = std::move(temporary_upload)]() mutable { owner.reset(); });
+			return {result, stage_offset};
+		}
+		return {upload_buffer, stage_offset};
+	}
+
+	TouchBuffer(*owner);
+	std::vector<std::pair<uint64_t, uint64_t>> uploads;
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, false,
+	    [&](uint64_t address, uint64_t upload_size) noexcept {
+		    uploads.emplace_back(address, upload_size);
+	    },
+	    [&]() noexcept {
+		    for (const auto& [address, upload_size]: uploads) {
+			    owner->CopyFrom(RecordingScheduler(m_scheduler).Current(), *upload_buffer,
+			                    stage_offset + address - vaddr, owner->Offset(address), upload_size,
+			                    vk::AccessFlagBits::eHostWrite);
+		    }
+	    });
+	if (temporary_upload) {
+		RecordingScheduler(m_scheduler).DeferOperation(
+		    [owner = std::move(temporary_upload)]() mutable { owner.reset(); });
+	}
+	return {owner, owner->Offset(vaddr)};
+}
+
+void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data) {
+	if (vaddr == 0 || data.empty() || data.size() > UINT64_MAX - vaddr) {
+		EXIT("BufferCache: invalid host DMA write\n");
+	}
+	Libs::LibKernel::Memory::WriteBacking(vaddr, data.data(), data.size());
+
+	const auto end = vaddr + data.size();
+	for (const auto& [address, id]: m_buffers) {
+		auto&      buffer     = m_slot_buffers[id];
+		const auto buffer_end = address + buffer.Size();
+		const auto begin      = std::max(vaddr, address);
+		const auto range_end  = std::min(end, buffer_end);
+		if (begin >= range_end) {
+			continue;
+		}
+		WriteDataBuffer(buffer, begin, data.data() + begin - vaddr, range_end - begin);
+		TouchBuffer(buffer);
+	}
+}
+
+void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
+		EXIT("BufferCache: fill range must be dword aligned\n");
+	}
+	if (is_gds) {
+		if (vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - vaddr) {
+			EXIT("BufferCache: GDS fill range is out of bounds\n");
+		}
+		m_gds_buffer.Fill(vaddr, size, value);
+		return;
+	}
+	if (vaddr == 0) {
+		EXIT("BufferCache: invalid fill memory address\n");
+	}
+	(void)m_texture_cache.ClearMeta(vaddr);
+	{
+		const auto region = m_texture_cache.QueryRegion(vaddr, size);
+		if (!HasGpuDirtyBytes(vaddr, size) && !region.gpu_image_bytes) {
+			if (region.image_bytes) {
+				m_texture_cache.InvalidateMemory(vaddr, size);
+			}
+			std::array<uint32_t, 4096> values;
+			values.fill(value);
+			const std::span<const uint8_t> bytes {reinterpret_cast<const uint8_t*>(values.data()),
+			                                      sizeof(values)};
+			for (uint64_t offset = 0; offset < size;) {
+				const auto chunk = std::min<uint64_t>(size - offset, bytes.size());
+				WriteHostMemory(vaddr + offset, bytes.first(chunk));
+				offset += chunk;
+			}
+			return;
+		}
+	}
+
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	const auto id          = FindBuffer(vaddr, size);
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true, id);
+	EXIT_IF(dst == nullptr);
+	dst->Fill(dst_offset, size, value);
+}
+
+void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
+                             bool src_gds) {
+	const bool dst_memory = !dst_gds;
+	const bool src_memory = !src_gds;
+	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
+	    ((dst_gds || src_gds) && ((dst_vaddr | src_vaddr | size) & 3u) != 0) ||
+	    size > UINT64_MAX - dst_vaddr || size > UINT64_MAX - src_vaddr || (dst_gds && src_gds) ||
+	    (dst_gds && (dst_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - dst_vaddr)) ||
+	    (src_gds && (src_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - src_vaddr))) {
+		EXIT("BufferCache: invalid copy range, src=0x%016" PRIx64 " dst=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
+		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
+	}
+	if (src_memory || dst_memory) {
+		const auto src_region =
+		    src_memory ? m_texture_cache.QueryRegion(src_vaddr, size) : TextureCache::RegionInfo {};
+		const auto dst_region =
+		    dst_memory ? m_texture_cache.QueryRegion(dst_vaddr, size) : TextureCache::RegionInfo {};
+		if (src_memory && dst_memory && !HasGpuDirtyBytes(src_vaddr, size) &&
+		    !HasGpuDirtyBytes(dst_vaddr, size) && !src_region.gpu_image_bytes &&
+		    !dst_region.gpu_image_bytes) {
+			if (dst_region.image_bytes) {
+				m_texture_cache.InvalidateMemory(dst_vaddr, size);
+			}
+			std::array<uint8_t, 64 * 1024> bytes;
+			for (uint64_t offset = 0; offset < size;) {
+				const auto chunk = std::min<uint64_t>(size - offset, bytes.size());
+				if (!Libs::LibKernel::Memory::TryReadBacking(src_vaddr + offset, bytes.data(),
+				                                             chunk)) {
+					EXIT("BufferCache: host DMA source has no direct backing\n");
+				}
+				WriteHostMemory(dst_vaddr + offset, std::span {bytes}.first(chunk));
+				offset += chunk;
+			}
+			return;
+		}
+	}
+
+	auto& command = RecordingScheduler(m_scheduler).Current();
+	if (dst_memory) {
+		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
+	}
+	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};
+	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
+	auto [src, src_offset] = src_memory ? ObtainBuffer(src_vaddr, size, false, true, src_id)
+	                                    : std::pair {&m_gds_buffer, src_vaddr};
+	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
+	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	EXIT_IF(src == nullptr || dst == nullptr);
+	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
+		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
+	}
+	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+}
+
+bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid registered-region query\n");
+	}
+	// Cached buffers are ordered and non-overlapping. The last buffer beginning before the query
+	// end is therefore the only possible intersection.
+	const auto candidate = m_buffers.lower_bound(vaddr + size);
+	if (candidate == m_buffers.begin()) {
+		return false;
+	}
+	const auto& [address, id] = *std::prev(candidate);
+	return address + m_slot_buffers[id].Size() > vaddr;
+}
+
+bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
+	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
+bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
+}
+
+void BufferCache::RunGarbageCollector() {
+	const auto tick = m_gc_tick++;
+	if (m_graphics.CanReportMemoryUsage()) {
+		const auto budget     = m_graphics.GetAdaptiveDeviceMemoryBudget();
+		m_total_used_memory   = budget.usage;
+		m_trigger_gc_memory   = budget.target;
+		m_critical_gc_memory  = budget.critical;
+	}
+	if (m_total_used_memory < m_trigger_gc_memory) {
+		return;
+	}
+
+	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const size_t   limit      = aggressive ? 64 : 32;
+
+	std::vector<BufferId> dirty_buffers;
+	std::vector<DownloadCopy> copies;
+	size_t                    retire_count = 0;
+	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+		auto& buffer = m_slot_buffers[id];
+		EXIT_IF(buffer.is_deleted);
+		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
+		                                           buffer.Size(), "garbage collection");
+		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
+		if (dirty && !aggressive) {
+			return false;
+		}
+		if (dirty) {
+			m_memory_tracker.ForEachDownloadRange<false>(
+			    buffer.CpuAddress(), buffer.Size(),
+			    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
+				    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, dirty_address,
+				                                           dirty_size, "garbage collection");
+			    },
+			    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
+				    m_gpu_modified_ranges.ForEachIntersection(
+				        dirty_address, dirty_size, [&](RangeSet::Range range) {
+					    copies.push_back({&buffer, range.address - buffer.CpuAddress(),
+					                      range.address, range.size});
+				        });
+				});
+			dirty_buffers.push_back(id);
+		} else {
+			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			DeleteBuffer(id);
+		}
+		return ++retire_count == limit;
+	});
+	if (dirty_buffers.empty()) {
+		return;
+	}
+
+	EXIT_IF(copies.empty());
+	DownloadBufferMemory(copies);
+	for (const auto id: dirty_buffers) {
+		auto& buffer = m_slot_buffers[id];
+		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
+		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) ||
+		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
+			EXIT("BufferCache: garbage collection retained GPU ownership\n");
+		}
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		Unregister(id);
+		m_slot_buffers.erase(id);
+	}
+}
+
+void BufferCache::ProcessFaultBuffer() {
+	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start < finish) {
+			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+		}
+	}
+}
+
+} // namespace Libs::Graphics

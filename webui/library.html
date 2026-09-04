@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Biblioteca</title>
+    <style>
+      :root {
+        --bg: #02060d;
+        --surface: #111821dd;
+        --surface2: #171d26e8;
+        --line: #ffffff26;
+        --text: #f7f8fc;
+        --muted: #b7bbc5;
+        --focus: #fff;
+        --blue: #9bc8ff;
+        --accent: #8f52ff;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          16px Arial,
+          Helvetica,
+          sans-serif;
+        overflow: hidden;
+      }
+      body:before {
+        content: "";
+        position: fixed;
+        inset: -8%;
+        background: var(--hero, url(""));
+        background-size: cover;
+        background-position: center;
+        filter: blur(28px) brightness(0.42);
+        opacity: 0.62;
+        z-index: -2;
+        transition: background-image 0.35s;
+      }
+      body:after {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background:
+          linear-gradient(90deg, #02060df4 0%, #02060d9c 45%, #02060d5c),
+          linear-gradient(0deg, #02060d 0%, transparent 55%);
+        z-index: -1;
+      }
+      .top {
+        height: 86px;
+        display: flex;
+        align-items: center;
+        padding: 20px 42px;
+        gap: 35px;
+      }
+      .profile {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-weight: 600;
+      }
+      .avatar {
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        background: linear-gradient(140deg, #142b50, #b9dcff);
+        display: grid;
+        place-items: center;
+        font-size: 25px;
+      }
+      .sub {
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 3px;
+      }
+      .nav {
+        display: flex;
+        gap: 32px;
+        margin: auto;
+        font-size: 25px;
+        color: #d8dce6;
+      }
+      .nav a {
+        color: inherit;
+        text-decoration: none;
+        opacity: 0.75;
+        padding: 9px;
+      }
+      .nav a.active {
+        opacity: 1;
+        border-bottom: 3px solid var(--blue);
+        color: #fff;
+      }
+      .clock {
+        font-size: 17px;
+        color: #e6e8ed;
+      }
+      .content {
+        height: calc(100vh - 86px);
+        padding: 24px 8.5vw 36px;
+        overflow: auto;
+      }
+      .eyebrow {
+        color: var(--blue);
+        font-size: 14px;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+      }
+      .heading {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        margin: 7px 0 20px;
+      }
+      .heading h1 {
+        font-size: 37px;
+        margin: 0;
+      }
+      .filters {
+        display: flex;
+        gap: 10px;
+      }
+      .filter {
+        background: transparent;
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        color: var(--muted);
+        padding: 9px 15px;
+        cursor: pointer;
+      }
+      .filter.selected,
+      .filter:hover {
+        border-color: var(--blue);
+        color: #fff;
+        background: #ffffff12;
+      }
+      .library {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+        gap: 22px;
+      }
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 13px;
+        background: var(--surface);
+        padding: 0;
+        overflow: hidden;
+        cursor: pointer;
+        transition: 0.2s;
+        position: relative;
+        aspect-ratio: 1.06;
+      }
+      .card img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+      .card .label {
+        position: absolute;
+        inset: auto 0 0;
+        padding: 35px 12px 11px;
+        background: linear-gradient(transparent, #07101ccc);
+        font-weight: 600;
+      }
+      .card:focus,
+      .card.active {
+        outline: 3px solid var(--focus);
+        outline-offset: 3px;
+        transform: translateY(-5px);
+        box-shadow: 0 0 0 6px #9bc8ff45;
+      }
+      .empty {
+        padding: 70px;
+        text-align: center;
+        color: var(--muted);
+        grid-column: 1/-1;
+      }
+      .detail {
+        position: fixed;
+        right: 6vw;
+        bottom: 44px;
+        width: 310px;
+        padding: 20px;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--surface2);
+        backdrop-filter: blur(20px);
+        box-shadow: 0 18px 50px #0008;
+      }
+      .detail h2 {
+        margin: 0 0 7px;
+        font-size: 23px;
+      }
+      .detail p {
+        margin: 0 0 16px;
+        color: var(--muted);
+        line-height: 1.4;
+      }
+      .actions {
+        display: flex;
+        gap: 8px;
+      }
+      .btn {
+        border: 0;
+        border-radius: 22px;
+        padding: 11px 21px;
+        background: #f4f6fb;
+        color: #0a0e15;
+        font-weight: bold;
+        cursor: pointer;
+      }
+      .btn.secondary {
+        background: #ffffff18;
+        border: 1px solid var(--line);
+        color: #fff;
+      }
+      .btn:focus {
+        outline: 2px solid var(--blue);
+        outline-offset: 2px;
+      }
+      .toast {
+        position: fixed;
+        left: 50%;
+        bottom: 24px;
+        transform: translateX(-50%);
+        background: #fff;
+        color: #111;
+        padding: 12px 20px;
+        border-radius: 10px;
+        display: none;
+      }
+      @media (max-width: 800px) {
+        .top {
+          padding: 16px 20px;
+        }
+        .nav {
+          gap: 5px;
+        }
+        .content {
+          padding: 20px;
+        }
+        .library {
+          grid-template-columns: repeat(3, 1fr);
+        }
+        .detail {
+          position: static;
+          width: auto;
+          margin-top: 22px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="top">
+      <div class="profile">
+        <div class="avatar">◉</div>
+        <div>
+          <div>Player1 ✚</div>
+          <div class="sub">🏆 21.337</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <a href="/index.html">▦</a><a class="active" href="/library.html">🎮</a
+        ><a href="/import.html">＋</a><a href="/settings.html">⚙</a
+        ><a href="/system.html">⌕</a>
+      </nav>
+      <div class="clock" id="clock"></div>
+    </header>
+    <main class="content">
+      <div class="eyebrow">PKG_DoW</div>
+      <div class="heading">
+        <h1>Biblioteca</h1>
+        <div class="filters">
+          <button class="filter selected" data-filter="all">Todos</button
+          ><button class="filter" data-filter="favorite">Favoritos</button
+          ><button class="filter" data-filter="recent">Recentes</button>
+        </div>
+      </div>
+      <section class="library" id="library" tabindex="0">
+        <div class="empty">Carregando biblioteca…</div>
+      </section>
+    </main>
+    <aside class="detail" id="detail">
+      <h2>Selecione um jogo</h2>
+      <p>Escolha um título para ver detalhes.</p>
+    </aside>
+    <div class="toast" id="toast"></div>
+    <script>
+      let games = [],
+        chosen = null,
+        removeArmed = false;
+      const $ = (s) => document.querySelector(s);
+      const esc = (s) =>
+        String(s || "").replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        );
+      function render(list = games) {
+        const el = $("#library");
+        el.innerHTML = list.length
+          ? list
+              .map(
+                (g, i) =>
+                  `<article class="card ${chosen?.id === g.id || (!chosen && i === 0) ? "active" : ""}" tabindex="0" data-id="${esc(g.id)}">${g.icon ? `<img src="${esc(g.icon)}" alt="">` : '<div style="height:100%;display:grid;place-items:center;font-size:42px">🎮</div>'}<div class="label">${esc(g.title)}</div></article>`,
+              )
+              .join("")
+          : '<div class="empty">Nenhum jogo. Importe PKG ou pasta extraída.</div>';
+        el.querySelectorAll(".card").forEach((c) => {
+          c.onclick = () => select(c.dataset.id);
+          c.onfocus = () => select(c.dataset.id);
+        });
+      }
+      function select(id) {
+        chosen = games.find((g) => String(g.id) === String(id));
+        removeArmed = false;
+        if (!chosen) return;
+        document.documentElement.style.setProperty(
+          "--hero",
+          chosen.icon ? `url("${chosen.icon}")` : "none",
+        );
+        document
+          .querySelectorAll(".card")
+          .forEach((c) =>
+            c.classList.toggle("active", c.dataset.id === String(id)),
+          );
+        $("#detail").innerHTML =
+          `<h2>${esc(chosen.title)}</h2><p>${esc([chosen.platform, chosen.title_id, chosen.kind === "pkg" ? "PKG pronto para importar" : String(chosen.status || "").replace(/shadPS4/gi, "Core PS4").replace(/KytyPS5 Payload/gi, "Core PS5")].filter(Boolean).join(" · "))}</p><div class="actions"><button class="btn" onclick="launch()">${chosen.kind === "pkg" ? "⇩ Instalar" : "▶ Jogar"}</button><button class="btn secondary" onclick="favorite()">${chosen.favorite ? "★" : "☆"} Favoritar</button><button id="removeBtn" class="btn secondary" onclick="removeGame()">Remover</button></div>`;
+      }
+      async function api(url, body) {
+        const r = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }),
+          d = await r.json().catch(() => ({}));
+        if (!r.ok || d.ok === false)
+          throw new Error(d.error || `HTTP ${r.status}`);
+        return d;
+      }
+      function msg(t, error = false) {
+        let x = $("#toast");
+        x.textContent = t;
+        x.style.display = "block";
+        x.style.background = error ? "#5b1e2b" : "#fff";
+        x.style.color = error ? "#fff" : "#111";
+        setTimeout(() => (x.style.display = "none"), 2200);
+      }
+      async function launch() {
+        if (!chosen) return;
+        try {
+          const d = await api("/api/launch", { id: chosen.id });
+          if (d.job)
+            location.href = "/import.html?job=" + encodeURIComponent(d.job);
+          else msg("Iniciando " + chosen.title);
+        } catch (e) {
+          msg(e.message, true);
+        }
+      }
+      async function favorite() {
+        if (!chosen) return;
+        try {
+          chosen.favorite = !chosen.favorite;
+          await api("/api/favorite", { id: chosen.id, value: chosen.favorite });
+          render();
+          select(chosen.id);
+        } catch (e) {
+          msg(e.message, true);
+        }
+      }
+      async function removeGame() {
+        if (!chosen) return;
+        if (!removeArmed) {
+          removeArmed = true;
+          $("#removeBtn").textContent = "Confirmar remoção";
+          return;
+        }
+        try {
+          await api("/api/remove", { id: chosen.id });
+          games = games.filter((g) => g.id !== chosen.id);
+          chosen = null;
+          render();
+          $("#detail").innerHTML =
+            "<h2>Jogo removido</h2><p>Arquivo original não foi apagado.</p>";
+          msg("Removido da biblioteca");
+        } catch (e) {
+          msg(e.message, true);
+        }
+      }
+      document.querySelectorAll(".filter").forEach(
+        (b) =>
+          (b.onclick = () => {
+            document
+              .querySelectorAll(".filter")
+              .forEach((x) => x.classList.remove("selected"));
+            b.classList.add("selected");
+            render(
+              b.dataset.filter === "favorite"
+                ? games.filter((g) => g.favorite)
+                : b.dataset.filter === "recent"
+                  ? [...games]
+                      .sort(
+                        (a, z) => (z.last_played || 0) - (a.last_played || 0),
+                      )
+                      .slice(0, 8)
+                  : games,
+            );
+          }),
+      );
+      function tick() {
+        $("#clock").textContent = new Date().toLocaleTimeString("pt-BR", {
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+      }
+      setInterval(tick, 1000);
+      tick();
+      fetch("/api/library")
+        .then((r) => r.json())
+        .then((d) => {
+          games = Array.isArray(d) ? d : d.games || [];
+          render();
+          if (games[0]) select(games[0].id);
+        })
+        .catch((e) => msg(e.message, true));
+    </script>
+  </body>
+</html>

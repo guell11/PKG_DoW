@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>PKG_DoW</title>
+    <style>
+      :root {
+        --bg: #02060d;
+        --surface: #111821dd;
+        --line: #ffffff26;
+        --text: #f7f8fc;
+        --muted: #b7bbc5;
+        --blue: #9bc8ff;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        font: 15px Arial;
+        overflow: hidden;
+      }
+      .screen {
+        height: 100%;
+        position: relative;
+        isolation: isolate;
+      }
+      .backdrop {
+        position: absolute;
+        inset: 0;
+        background: radial-gradient(circle at 70% 35%, #203d72, #02060d 70%);
+        z-index: -1;
+        background-position: 70% 35%;
+        background-size: auto 116%;
+        background-repeat: no-repeat;
+        filter: saturate(1.16) contrast(1.04);
+        transition: background-image 0.25s ease;
+      }
+      .backdrop:after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(0deg, #02060df8 0%, transparent 38%),
+          linear-gradient(90deg, #02060df4 0%, #02060da8 31%, #02060d26 69%, #02060d9c 100%);
+      }
+      header {
+        height: 96px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 24px 42px;
+      }
+      .profile,
+      .right {
+        display: flex;
+        align-items: center;
+        gap: 13px;
+      }
+      .avatar {
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        border: 2px solid #83baff;
+        background: radial-gradient(circle at 40% 30%, #9bd2ff, #111b2b 55%);
+      }
+      .profile strong {
+        font-size: 17px;
+      }
+      .sub {
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .nav {
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        gap: 30px;
+      }
+      .nav button,
+      .right button {
+        border: 0;
+        background: transparent;
+        color: #fff;
+        font-size: 25px;
+        padding: 7px;
+        cursor: pointer;
+      }
+      .nav button.active {
+        border-bottom: 3px solid var(--blue);
+      }
+      .hero {
+        height: 49%;
+        display: flex;
+        align-items: center;
+        padding: 10px 9%;
+        position: relative;
+      }
+      .copy {
+        max-width: 430px;
+      }
+      .eyebrow {
+        color: var(--blue);
+        font-weight: bold;
+        letter-spacing: 1.2px;
+        text-transform: uppercase;
+        font-size: 12px;
+      }
+      .copy h1 {
+        font-size: 44px;
+        line-height: 1;
+        margin: 13px 0;
+      }
+      .copy h2 {
+        font-size: 18px;
+        margin: 0 0 13px;
+      }
+      .copy p {
+        color: #d2d5df;
+        font-size: 16px;
+      }
+      .actions {
+        display: flex;
+        gap: 12px;
+        margin-top: 28px;
+      }
+      .btn {
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        padding: 13px 62px;
+        background: #ffffff16;
+        color: #fff;
+        font-size: 17px;
+        font-weight: bold;
+        cursor: pointer;
+      }
+      .btn.primary {
+        background: #f7f8fc;
+        color: #09101a;
+      }
+      .btn.round {
+        padding: 13px 17px;
+      }
+      .cover {
+        position: absolute;
+        right: 10%;
+        top: 10%;
+        width: 270px;
+        height: 350px;
+        border-radius: 14px;
+        background: #111821;
+        border: 1px solid #ffffff77;
+        overflow: hidden;
+        box-shadow: 0 20px 45px #000b;
+      }
+      .cover img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .cover-label {
+        padding: 18px;
+        font-weight: bold;
+        position: absolute;
+        bottom: 0;
+        width: 100%;
+        background: linear-gradient(transparent, #07101cee);
+      }
+      .games {
+        display: flex;
+        gap: 10px;
+        margin: 22px 9% 0;
+        overflow: hidden;
+      }
+      .widgets {
+        display: grid;
+        grid-template-columns: 1.2fr 1fr 1fr;
+        gap: 14px;
+        margin: 0 9%;
+      }
+      .widget {
+        min-height: 92px;
+        padding: 15px 17px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: #111821d9;
+        backdrop-filter: blur(16px);
+      }
+      .widget strong,
+      .widget small {
+        display: block;
+      }
+      .widget small {
+        color: var(--muted);
+        margin-top: 8px;
+      }
+      .widget button {
+        margin-top: 10px;
+        border: 0;
+        background: transparent;
+        color: var(--blue);
+        padding: 0;
+        cursor: pointer;
+      }
+      .game {
+        flex: 0 0 126px;
+        height: 126px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: #182536;
+        display: flex;
+        align-items: flex-end;
+        padding: 10px;
+        font-weight: bold;
+        position: relative;
+        overflow: hidden;
+        cursor: pointer;
+      }
+      .game img {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .game span {
+        position: relative;
+        text-shadow: 1px 1px 3px #000;
+      }
+      .game.selected {
+        outline: 2px solid var(--blue);
+        outline-offset: 2px;
+      }
+      .empty {
+        color: var(--muted);
+        padding: 25px;
+      }
+      .empty a {
+        color: #09101a;
+        background: #fff;
+        padding: 10px 18px;
+        border-radius: 22px;
+        display: inline-block;
+        margin-top: 10px;
+      }
+      .footer {
+        position: absolute;
+        bottom: 17px;
+        right: 40px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      @media (max-width: 650px) {
+        header {
+          padding: 18px;
+        }
+        .nav {
+          gap: 8px;
+        }
+        .right button {
+          display: none;
+        }
+        .cover {
+          opacity: 0.3;
+          right: 4%;
+        }
+        .copy {
+          max-width: 90%;
+        }
+        .copy h1 {
+          font-size: 34px;
+        }
+        .game {
+          flex-basis: 105px;
+          height: 105px;
+        }
+        .widgets {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="screen">
+      <div class="backdrop"></div>
+      <header>
+        <div class="profile">
+          <div class="avatar"></div>
+          <div>
+            <strong id="player">Player</strong>
+            <div class="sub">PKG_DoW</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <button onclick="go('/library.html')">▦</button
+          ><button class="active">🎮</button
+          ><button onclick="go('/import.html')">♜</button
+          ><button onclick="go('/library.html')">⌕</button>
+        </nav>
+        <div class="right">
+          <button onclick="go('/settings.html')">⚙</button
+          ><time id="clock">--:--</time>
+        </div>
+      </header>
+      <section class="hero">
+        <div class="copy">
+          <div class="eyebrow">Jogo em destaque</div>
+          <h1 id="title">Biblioteca vazia</h1>
+          <h2 id="tagline"></h2>
+          <p id="description">Importe um PKG para começar.</p>
+          <div class="actions">
+            <button class="btn primary" id="playButton" onclick="play()">Jogar</button
+            ><button class="btn round" onclick="go('/library.html')">
+              •••
+            </button>
+          </div>
+        </div>
+        <div class="cover" id="cover"></div>
+      </section>
+      <section class="widgets">
+        <article class="widget">
+          <strong>🟢 Amigos online</strong>
+          <small>Nenhum serviço social conectado.</small>
+        </article>
+        <article class="widget">
+          <strong>▦ Biblioteca local</strong>
+          <small id="librarySummary">Carregando jogos...</small>
+          <button onclick="go('/library.html')">Abrir coleção ›</button>
+        </article>
+        <article class="widget">
+          <strong>⇩ Importar jogos</strong>
+          <small>PKG ou pasta extraída.</small>
+          <button onclick="go('/import.html')">Importar agora ›</button>
+        </article>
+      </section>
+      <section class="games" id="games"></section>
+      <div class="footer">R3 · Personalizar</div>
+    </main>
+    <script>
+      let games = [],
+        chosen = null;
+      const go = (p) => (location.href = p);
+      const publicStatus = (s) => String(s || "")
+        .replace(/shadPS4/gi, "Core PS4")
+        .replace(/KytyPS5 Payload/gi, "Core PS5");
+      function select(g) {
+        chosen = g;
+        title.textContent = g.title || "Sem título";
+        tagline.textContent = [g.platform, publicStatus(g.status)]
+          .filter(Boolean)
+          .join(" · ");
+        description.textContent =
+          g.kind === "pkg"
+            ? "Pacote pronto para importar."
+            : g.last_played
+              ? "Última sessão: " +
+                new Date(g.last_played * 1000).toLocaleString("pt-BR")
+              : "Disponível na biblioteca.";
+        cover.innerHTML = g.icon
+          ? '<img src="' + g.icon + '" alt="">'
+          : '<div class="cover-label">' + (g.title || "Jogo") + "</div>";
+        const backdrop = document.querySelector(".backdrop");
+        backdrop.style.backgroundImage = g.icon
+          ? `url("${g.icon}")`
+          : "radial-gradient(circle at 70% 35%,#203d72,#02060d 70%)";
+        playButton.textContent = g.kind === "pkg" ? "Instalar" : "Jogar";
+        document
+          .querySelectorAll(".game")
+          .forEach((x) => x.classList.toggle("selected", x.dataset.id == g.id));
+      }
+      function render() {
+        if (!games.length) {
+          gamesEl.innerHTML =
+            '<div class="empty">Nenhum jogo.<br><a href="/import.html">Importar PKG</a></div>';
+          return;
+        }
+        gamesEl.innerHTML = games
+          .slice(0, 10)
+          .map(
+            (g) =>
+              '<div class="game" tabindex="0" data-id="' +
+              g.id +
+              '">' +
+              (g.icon ? '<img src="' + g.icon + '" alt="">' : "") +
+              "<span>" +
+              (g.title || "Sem título") +
+              "</span></div>",
+          )
+          .join("");
+        gamesEl.querySelectorAll(".game").forEach((x) => {
+          x.onclick = () => select(games.find((g) => g.id == x.dataset.id));
+          x.onfocus = x.onclick;
+        });
+        select(
+          [...games]
+            .filter((g) => g.icon && g.kind !== "pkg")
+            .sort((a, b) => (b.last_played || 0) - (a.last_played || 0))[0] ||
+            games.find((g) => g.kind !== "pkg") ||
+            games[0],
+        );
+      }
+      async function play() {
+        if (!chosen) return;
+        let r = await fetch("/api/launch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id: chosen.id }),
+          }),
+          d = await r.json().catch(() => ({}));
+        if (chosen.kind === "pkg" && d.job)
+          go("/import.html?job=" + encodeURIComponent(d.job));
+      }
+      async function load() {
+        try {
+          let d = await (await fetch("/api/library")).json();
+          games = Array.isArray(d) ? d : d.games || [];
+          document.getElementById("librarySummary").textContent =
+            `${games.length} jogo(s) na biblioteca.`;
+          render();
+        } catch (e) {
+          render();
+        }
+        try {
+          let d = await (await fetch("/api/settings")).json();
+          if (d.player_name) player.textContent = d.player_name;
+        } catch (e) {}
+      }
+      const gamesEl = document.getElementById("games");
+      document.getElementById("clock").textContent =
+        new Date().toLocaleTimeString("pt-BR", {
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+      load();
+    </script>
+  </body>
+</html>

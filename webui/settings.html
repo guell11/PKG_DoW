@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>PKG_DoW · Configurações</title>
+    <style>
+      :root {
+        --bg: #02060d;
+        --surface: #111821dd;
+        --surface2: #171d26e8;
+        --line: #ffffff26;
+        --text: #f7f8fc;
+        --muted: #b7bbc5;
+        --focus: #fff;
+        --blue: #9bc8ff;
+        --accent: #8f52ff;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: radial-gradient(
+          circle at 70% -10%,
+          #26304d 0,
+          #08101d 35%,
+          var(--bg) 75%
+        );
+        color: var(--text);
+        font:
+          15px/1.45 system-ui,
+          -apple-system,
+          Segoe UI,
+          sans-serif;
+        min-height: 100vh;
+      }
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+      .top {
+        height: 82px;
+        display: flex;
+        align-items: center;
+        padding: 0 44px;
+        border-bottom: 1px solid var(--line);
+        background: #070c15cc;
+        backdrop-filter: blur(18px);
+      }
+      .brand {
+        font-size: 23px;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+      }
+      .brand i {
+        color: var(--blue);
+        font-style: normal;
+      }
+      .topnav {
+        margin-left: auto;
+        display: flex;
+        gap: 27px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .topnav a:hover {
+        color: var(--text);
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: 272px 1fr;
+        min-height: calc(100vh - 82px);
+      }
+      aside {
+        padding: 42px 22px;
+        border-right: 1px solid var(--line);
+        background: #090f18aa;
+      }
+      .eyebrow {
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        color: var(--muted);
+        font-size: 11px;
+        margin: 0 18px 24px;
+      }
+      .menu {
+        display: grid;
+        gap: 7px;
+      }
+      .menu button {
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        text-align: left;
+        padding: 15px 18px;
+        border-radius: 9px;
+        font: inherit;
+        cursor: pointer;
+      }
+      .menu button:hover,
+      .menu button.active {
+        background: var(--surface2);
+        color: var(--text);
+      }
+      .menu button.active {
+        box-shadow: inset 3px 0 var(--blue);
+        color: var(--focus);
+      }
+      main {
+        padding: 54px clamp(28px, 6vw, 100px);
+        max-width: 1120px;
+        width: 100%;
+      }
+      .heading {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        margin-bottom: 32px;
+      }
+      .heading h1 {
+        font-size: 38px;
+        line-height: 1;
+        margin: 0 0 9px;
+      }
+      .heading p {
+        margin: 0;
+        color: var(--muted);
+      }
+      .status {
+        color: #bfffd4;
+        font-size: 12px;
+      }
+      .panel {
+        display: none;
+      }
+      .panel.active {
+        display: block;
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        margin-bottom: 17px;
+        overflow: hidden;
+        box-shadow: 0 15px 40px #0004;
+      }
+      .card h2 {
+        font-size: 15px;
+        margin: 0;
+        padding: 20px 24px;
+        border-bottom: 1px solid var(--line);
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        min-height: 67px;
+        padding: 13px 24px;
+        border-bottom: 1px solid #ffffff13;
+      }
+      .row:last-child {
+        border-bottom: 0;
+      }
+      .copy {
+        flex: 1;
+      }
+      .copy strong {
+        display: block;
+        font-weight: 600;
+      }
+      .copy span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 2px;
+      }
+      .control {
+        color: var(--blue);
+        font-size: 13px;
+      }
+      select,
+      input[type="number"] {
+        background: #0b111b;
+        border: 1px solid var(--line);
+        color: var(--text);
+        border-radius: 6px;
+        padding: 8px 10px;
+        font: inherit;
+      }
+      input[type="checkbox"] {
+        appearance: none;
+        width: 38px;
+        height: 22px;
+        border-radius: 20px;
+        background: #303744;
+        position: relative;
+        cursor: pointer;
+      }
+      input[type="checkbox"]:before {
+        content: "";
+        position: absolute;
+        width: 16px;
+        height: 16px;
+        top: 3px;
+        left: 3px;
+        border-radius: 50%;
+        background: #a8afbd;
+        transition: 0.2s;
+      }
+      input[type="checkbox"]:checked {
+        background: var(--accent);
+      }
+      input[type="checkbox"]:checked:before {
+        left: 19px;
+        background: #fff;
+      }
+      .hint {
+        padding: 16px 24px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .footer {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 25px;
+      }
+      @media (max-width: 700px) {
+        .top {
+          padding: 0 20px;
+        }
+        .topnav {
+          gap: 10px;
+        }
+        .layout {
+          grid-template-columns: 1fr;
+        }
+        aside {
+          padding: 18px;
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+        .menu {
+          display: flex;
+          overflow: auto;
+        }
+        .menu button {
+          white-space: nowrap;
+          padding: 10px 14px;
+        }
+        main {
+          padding: 32px 18px;
+        }
+        .heading h1 {
+          font-size: 30px;
+        }
+      }
+      @media (min-width: 701px) and (max-height: 800px) {
+        .top { height: 72px; }
+        .layout { min-height: calc(100vh - 72px); }
+        aside { padding-top: 34px; }
+        main { padding-top: 40px; padding-bottom: 24px; }
+        .heading { margin-bottom: 26px; }
+        .row { min-height: 60px; padding-block: 10px; }
+        .card h2 { padding-block: 16px; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="top">
+      <a class="brand" href="/index.html">PKG_DoW <i>◈</i></a>
+      <nav class="topnav">
+        <a href="/index.html">Console</a><a href="/library.html">Biblioteca</a
+        ><a href="/import.html">Importar</a><a href="/system.html">Sistema</a>
+      </nav>
+    </header>
+    <div class="layout">
+      <aside>
+        <p class="eyebrow">Configurações</p>
+        <nav class="menu" aria-label="Seções">
+          <button class="active" data-panel="general">Geral</button
+          ><button data-panel="video">Vídeo</button
+          ><button data-panel="controls">Controles</button
+          ><button data-panel="system">Sistema</button>
+        </nav>
+      </aside>
+      <main>
+        <div class="heading">
+          <div>
+            <h1>Configurações</h1>
+            <p>Personalize sua experiência no console.</p>
+          </div>
+          <span class="status" id="status">● Pronto</span>
+        </div>
+        <section class="panel active" id="general">
+          <div class="card"><h2>Preferências</h2>
+            <label class="row"><span class="copy"><strong>Nome do jogador</strong><span>Nome mostrado no topo.</span></span><input data-key="player_name" maxlength="16" /></label>
+            <label class="row"><span class="copy"><strong>Iniciar em tela cheia</strong><span>Jogo ocupa toda tela.</span></span><input data-key="fullscreen" type="checkbox" /></label>
+            <label class="row"><span class="copy"><strong>Proteção SysV</strong><span>Compatibilidade de chamadas no Windows.</span></span><input data-key="redzone" type="checkbox" /></label>
+            <label class="row"><span class="copy"><strong>Fallback PlayGo</strong><span>Ativa fallback para títulos que exigem PlayGo.</span></span><input data-key="playgo_hack" type="checkbox" /></label>
+          </div>
+        </section>
+        <section class="panel" id="video">
+          <div class="card">
+            <h2>Renderização</h2>
+            <label class="row"><span class="copy"><strong>Perfil de desempenho</strong><span>Equilíbrio entre estabilidade e FPS.</span></span><select data-key="performance_profile"><option value="stable">Estável</option><option value="balanced">Balanceado</option><option value="turbo">Turbo</option><option value="custom">Personalizado</option></select></label>
+            <label class="row"><span class="copy"><strong>Present mode</strong><span>Sincronização de apresentação Vulkan.</span></span><select data-key="present_mode"><option>Fifo</option><option>Mailbox</option><option>Immediate</option></select></label>
+            <label class="row"><span class="copy"><strong>Resolução interna</strong><span>Resolução usada pelos jogos.</span></span><select data-key="resolution"><option>960x540</option><option>1280x720</option><option>1600x900</option><option>1920x1080</option><option>2560x1440</option></select></label>
+            <label class="row"><span class="copy"><strong>Otimização de shaders</strong><span>Compilação e cache de shaders.</span></span><select data-key="shader_optimization"><option>None</option><option>Size</option><option>Performance</option></select></label>
+            <label class="row"><span class="copy"><strong>VBlank virtual</strong><span>Frequência alvo.</span></span><input data-key="vblank_frequency" type="number" min="30" max="360" /></label>
+            <div class="hint" id="vulkan">
+              Vulkan: verificando disponibilidade…
+            </div>
+          </div>
+        </section>
+        <section class="panel" id="controls">
+          <div class="card">
+            <h2>Entrada</h2>
+            <label class="row"><span class="copy"><strong>Teclado e mouse como DualSense</strong><span>WASD move; mouse controla câmera; esquerdo/direito acionam R2/L2.</span></span><input data-key="keyboard_mouse_enabled" type="checkbox" /></label>
+            <label class="row"><span class="copy"><strong>Sensibilidade do mouse</strong><span>Velocidade do analógico direito virtual.</span></span><input data-key="mouse_sensitivity" type="number" min="0.2" max="4" step="0.05" /></label>
+            <label class="row"><span class="copy"><strong>Boot PS4</strong><span>Modo usado para iniciar jogos PS4.</span></span><select data-key="ps4_boot_mode"><option value="auto">Automático</option><option value="eboot">eboot.bin direto</option><option value="cusa">ID CUSA</option></select></label>
+          </div>
+        </section>
+        <section class="panel" id="system">
+          <div class="card">
+            <h2>Emulador</h2>
+            <div class="row">
+              <span class="copy"
+                ><strong>Estado do sistema</strong
+                ><span>Serviços locais e núcleo PKG_DoW.</span></span
+              ><span class="control" id="systemState">Verificando…</span>
+            </div>
+            <label class="row"><span class="copy"><strong>Core PS5</strong><span>Caminho do executável configurado.</span></span><input data-key="kyty_path" /></label>
+            <label class="row"><span class="copy"><strong>Core PS4</strong><span>Caminho do executável configurado.</span></span><input data-key="shadps4_path" /></label>
+            <div class="row">
+              <span class="copy"
+                ><strong>Versão</strong
+                ><span>Interface do PKG_DoW.</span></span
+              ><span class="control">1.0.0</span>
+            </div>
+          </div>
+          <div class="footer">
+            Alterações salvas automaticamente neste dispositivo.
+          </div>
+        </section>
+      </main>
+    </div>
+    <script>
+      (() => {
+        const q = (s) => document.querySelector(s),
+          settings = {};
+        document.querySelectorAll(".menu button").forEach(
+          (b) =>
+            (b.onclick = () => {
+              document
+                .querySelectorAll(".menu button,.panel")
+                .forEach((x) => x.classList.remove("active"));
+              b.classList.add("active");
+              q("#" + b.dataset.panel).classList.add("active");
+            }),
+        );
+        const fields = [...document.querySelectorAll("[data-key]")];
+        function apply(o) {
+          fields.forEach((x) => {
+            if (o?.[x.dataset.key] !== undefined)
+              x.type === "checkbox"
+                ? (x.checked = !!o[x.dataset.key])
+                : (x.value = o[x.dataset.key]);
+          });
+        }
+        fields.forEach(
+          (x) =>
+            (x.onchange = () => {
+              settings[x.dataset.key] =
+                x.type === "checkbox" ? x.checked : x.value;
+              fetch("/api/settings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(settings),
+              }).catch(() => {});
+              q("#status").textContent = "● Salvo";
+            }),
+        );
+        fetch("/api/settings")
+          .then((r) => r.json())
+          .then(apply)
+          .catch(() => {});
+        fetch("/api/vulkan")
+          .then((r) => r.json())
+          .then(
+            (x) =>
+              (q("#vulkan").textContent =
+                "Vulkan: " + (x.available ? "disponível" : "indisponível")),
+          )
+          .catch(
+            () => (q("#vulkan").textContent = "Vulkan: estado indisponível"),
+          );
+        fetch("/api/status")
+          .then((r) => r.json())
+          .then(
+            (x) =>
+              (q("#systemState").textContent = x.status || x.state || "Online"),
+          )
+          .catch(() => (q("#systemState").textContent = "Offline"));
+      })();
+    </script>
+  </body>
+</html>
